@@ -24,7 +24,6 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -135,11 +134,12 @@ function nowMs(): number {
 }
 
 function pointForEvent(
-  event: Pick<ReactPointerEvent<HTMLDivElement>, "clientX" | "clientY" | "currentTarget">,
+  event: Pick<MouseEvent, "clientX" | "clientY">,
+  target: HTMLDivElement,
   media: { readonly width: number; readonly height: number } | undefined,
 ): ContainedMediaPoint | null {
   if (!media) return null;
-  const bounds = event.currentTarget.getBoundingClientRect();
+  const bounds = target.getBoundingClientRect();
   return mapPointToContainedMedia({
     clientX: event.clientX,
     clientY: event.clientY,
@@ -202,10 +202,12 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
   const lastEventSequence = useRef<number | null>(null);
   const releasedLeaseKeys = useRef(new Set<string>());
   const streamRetryTimer = useRef<number | null>(null);
+  const simulatorOverlayRef = useRef<HTMLDivElement | null>(null);
   const activeTouch = useRef<ActiveTouch | null>(null);
   const activeKeyboardUsages = useRef(new Map<number, SimulatorSession>());
   const inputQueue = useRef<QueuedSimulatorInput[]>([]);
   const inputDrainPromise = useRef<Promise<void> | null>(null);
+  const sendInputRef = useRef(sendInput);
   const lastScrollAt = useRef(-Infinity);
   const mounted = useRef(true);
 
@@ -231,10 +233,13 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       height: optimisticMedia.height,
     };
   }, [optimisticMedia, sessionKey, sessionMedia]);
-  const mediaDimensions =
-    displayedSessionMedia && displayedSessionMedia.width > 0 && displayedSessionMedia.height > 0
-      ? { width: displayedSessionMedia.width, height: displayedSessionMedia.height }
-      : undefined;
+  const mediaDimensions = useMemo(
+    () =>
+      displayedSessionMedia && displayedSessionMedia.width > 0 && displayedSessionMedia.height > 0
+        ? { width: displayedSessionMedia.width, height: displayedSessionMedia.height }
+        : undefined,
+    [displayedSessionMedia],
+  );
   const streamUrl = useMemo(
     () => resolveSimulatorStreamUrl(environmentHttpBaseUrl, sessionMedia?.streamUrl),
     [environmentHttpBaseUrl, sessionMedia?.streamUrl],
@@ -266,6 +271,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       mounted.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    sendInputRef.current = sendInput;
+  }, [sendInput]);
 
   useEffect(() => {
     setOptimisticMedia((current) => {
@@ -340,7 +349,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
         const queued = inputQueue.current.shift();
         if (!queued) continue;
         try {
-          const result = await sendInput({
+          const result = await sendInputRef.current({
             environmentId: queued.environmentId,
             input: {
               threadId: queued.threadId,
@@ -369,7 +378,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       if (inputDrainPromise.current === drain) inputDrainPromise.current = null;
     });
     return drain;
-  }, [sendInput]);
+  }, []);
 
   const sendSimulatorEvent = useCallback(
     (event: SimulatorInputEvent, target: SimulatorSession | null = session): Promise<boolean> => {
@@ -597,7 +606,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       ) {
         return;
       }
-      const point = pointForEvent(event, mediaDimensions);
+      const point = pointForEvent(event, event.currentTarget, mediaDimensions);
       if (!point) return;
       event.preventDefault();
       event.currentTarget.focus({ preventScroll: true });
@@ -619,7 +628,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       const touch = activeTouch.current;
       if (!touch || touch.pointerId !== event.pointerId || !mediaDimensions) return;
       event.preventDefault();
-      const point = pointForEvent(event, mediaDimensions);
+      const point = pointForEvent(event, event.currentTarget, mediaDimensions);
       if (!point) return;
       touch.x = point.x;
       touch.y = point.y;
@@ -635,7 +644,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const touch = activeTouch.current;
       if (!touch || touch.pointerId !== event.pointerId) return;
-      const point = pointForEvent(event, mediaDimensions);
+      const point = pointForEvent(event, event.currentTarget, mediaDimensions);
       if (point) {
         touch.x = point.x;
         touch.y = point.y;
@@ -694,9 +703,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
   );
 
   const handleWheel = useCallback(
-    (event: ReactWheelEvent<HTMLDivElement>) => {
-      if (!pointerInputEnabled || !session || !mediaDimensions) return;
-      const point = pointForEvent(event, mediaDimensions);
+    (event: WheelEvent) => {
+      const overlay = simulatorOverlayRef.current;
+      if (!overlay || !pointerInputEnabled || !session || !mediaDimensions) return;
+      const point = pointForEvent(event, overlay, mediaDimensions);
       if (!point) return;
       const dx = clampSimulatorScrollDelta(event.deltaX);
       const dy = clampSimulatorScrollDelta(event.deltaY);
@@ -709,6 +719,13 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     },
     [mediaDimensions, pointerInputEnabled, sendSimulatorEvent, session],
   );
+
+  useEffect(() => {
+    const overlay = simulatorOverlayRef.current;
+    if (!overlay) return;
+    overlay.addEventListener("wheel", handleWheel, { passive: false });
+    return () => overlay.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
 
   const sendHome = useCallback(() => {
     sendSimulatorEvent({ type: "home" });
@@ -1017,6 +1034,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                       ) : null}
 
                       <div
+                        ref={simulatorOverlayRef}
                         className={cn(
                           "absolute inset-0 touch-none outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary",
                           pointerInputEnabled ? "cursor-crosshair" : "cursor-not-allowed",
@@ -1031,7 +1049,6 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                         onLostPointerCapture={endActiveTouch}
                         onKeyDown={handleKeyboardDown}
                         onKeyUp={handleKeyboardUp}
-                        onWheel={handleWheel}
                       />
                     </div>
 

@@ -7,11 +7,13 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as ProjectionSnapshotQuery from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as SimulatorAutomation from "../../../simulator/Automation.ts";
 import * as SimulatorManager from "../../../simulator/Manager.ts";
+import { releaseSimulatorLeaseAfterAutomationClose } from "../../../simulator/Release.ts";
 import { IosSimulatorToolkit, McpSimulatorWorkspaceUnavailableError } from "./tools.ts";
 
 const requireSimulator = () => McpInvocationContext.requireMcpCapability("ios-simulator");
@@ -50,8 +52,12 @@ type LeaseInput = {
   readonly generation: number;
 };
 
-const compact = (input: Readonly<Record<string, unknown>>): Record<string, unknown> =>
-  Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
+type Defined<T> = { [K in keyof T]: Exclude<T[K], undefined> };
+
+const compact = <T extends Readonly<Record<string, unknown>>>(input: T): Defined<T> =>
+  Object.fromEntries(
+    Object.entries(input).filter(([, value]) => value !== undefined),
+  ) as Defined<T>;
 
 const requireReadySession = Effect.fn("IosSimulatorToolkit.requireReadySession")(function* (
   invocation: McpInvocationContext.McpInvocationScope,
@@ -89,20 +95,28 @@ const requireReadySession = Effect.fn("IosSimulatorToolkit.requireReadySession")
   return session;
 });
 
-const withAutomation = <A>(
+const withAutomation = (
   input: LeaseInput,
   operation: string,
   action: (
     automation: SimulatorAutomation.SimulatorAutomation["Service"],
     context: { readonly session: SimulatorSession; readonly cwd: string },
-  ) => Effect.Effect<A, SimulatorAutomation.SimulatorAutomationError>,
+  ) => Effect.Effect<unknown, SimulatorAutomation.SimulatorAutomationError>,
 ) =>
   Effect.gen(function* () {
     const invocation = yield* requireSimulator();
     const session = yield* requireReadySession(invocation, input, operation);
     const cwd = yield* resolveThreadWorkspace(invocation);
     const automation = yield* SimulatorAutomation.SimulatorAutomation;
-    return yield* action(automation, { session, cwd });
+    const result = yield* action(automation, { session, cwd });
+    if (!Predicate.isObject(result)) {
+      return yield* new SimulatorAutomation.SimulatorAutomationToolError({
+        operation,
+        code: "invalid-response",
+        detail: "XcodeBuildMCP returned a non-object result.",
+      });
+    }
+    return result;
   });
 
 const handlers = {
@@ -139,29 +153,9 @@ const handlers = {
   ios_session_close: (input) =>
     Effect.gen(function* () {
       const invocation = yield* requireSimulator();
-      const automation = yield* SimulatorAutomation.SimulatorAutomation;
       const manager = yield* SimulatorManager.SimulatorManager;
-      // Stop the lease-scoped XcodeBuildMCP child before Manager tears down
-      // serve-sim and releases the host/device lock.
-      const status = yield* manager.status({
-        threadId: invocation.threadId,
-        leaseId: input.leaseId,
-      });
-      const session = status.session;
-      if (session !== null) {
-        if (session.generation !== input.generation) {
-          return yield* new SimulatorLeaseGenerationMismatchError({
-            leaseId: input.leaseId,
-            expectedGeneration: session.generation,
-            receivedGeneration: input.generation,
-          });
-        }
-        // The Manager snapshot is the authoritative exact lease identity.
-        // Closing by session avoids trusting a separately resolved workspace
-        // path and fences a release that raced the first automation call.
-        yield* automation.closeSession(session);
-      }
-      return yield* manager.release({
+      const automation = yield* SimulatorAutomation.SimulatorAutomation;
+      return yield* releaseSimulatorLeaseAfterAutomationClose(manager, automation, {
         threadId: invocation.threadId,
         leaseId: input.leaseId,
         generation: input.generation,
@@ -170,73 +164,55 @@ const handlers = {
   ios_build_run: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "build-run", (automation, context) =>
-      automation.buildRun({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationBuildRunInput),
+      automation.buildRun(compact({ ...operationInput, ...context })),
     );
   },
   ios_launch_app: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "launch-app", (automation, context) =>
-      automation.launch({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationLaunchInput),
+      automation.launch(compact({ ...operationInput, ...context })),
     );
   },
   ios_stop_app: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "stop-app", (automation, context) =>
-      automation.stop({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationStopInput),
+      automation.stop(compact({ ...operationInput, ...context })),
     );
   },
   ios_snapshot_ui: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "snapshot-ui", (automation, context) =>
-      automation.snapshotUi({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationSnapshotUiInput),
+      automation.snapshotUi(compact({ ...operationInput, ...context })),
     );
   },
   ios_screenshot: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "screenshot", (automation, context) =>
-      automation.screenshot({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationScreenshotInput),
+      automation.screenshot(compact({ ...operationInput, ...context })),
     );
   },
   ios_tap: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "tap", (automation, context) =>
-      automation.tap({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationTapInput),
+      automation.tap(compact({ ...operationInput, ...context })),
     );
   },
   ios_type_text: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "type-text", (automation, context) =>
-      automation.typeText({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationTypeTextInput),
+      automation.typeText(compact({ ...operationInput, ...context })),
     );
   },
   ios_wait_for_ui: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "wait-for-ui", (automation, context) =>
-      automation.waitForUi({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationWaitForUiInput),
+      automation.waitForUi(compact({ ...operationInput, ...context })),
     );
   },
   ios_swipe: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "swipe", (automation, context) =>
-      automation.swipe({
-        ...compact({ ...context, ...operationInput }),
-      } as unknown as SimulatorAutomation.SimulatorAutomationSwipeInput),
+      automation.swipe(compact({ ...operationInput, ...context })),
     );
   },
 } satisfies Parameters<typeof IosSimulatorToolkit.toLayer>[0];

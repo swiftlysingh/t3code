@@ -2,7 +2,9 @@ import { EnvironmentId, SimulatorLeaseId, SimulatorUdid, ThreadId } from "@t3too
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as References from "effect/References";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -29,7 +31,7 @@ const binding = {
   environmentId: EnvironmentId.make("environment-1"),
   threadId: ThreadId.make("thread-1"),
   leaseId: SimulatorLeaseId.make("lease-1"),
-  udid: SimulatorUdid.make("device-1"),
+  udid: SimulatorUdid.make("11111111-1111-4111-8111-111111111111"),
   generation: 3,
 } as const;
 
@@ -72,7 +74,9 @@ describe("SimulatorStreamAccess", () => {
     Effect.gen(function* () {
       const { token } = yield* issue();
       const [payload, signature] = token.split(".");
-      if (payload === undefined || signature === undefined) return;
+      if (payload === undefined || signature === undefined) {
+        throw new Error("issued simulator stream token must contain a payload and signature");
+      }
       const tamperedSignature = `${signature.slice(0, -1)}${signature.endsWith("A") ? "B" : "A"}`;
       expect(yield* resolveSimulatorStream(`${payload}.${tamperedSignature}`)).toBeNull();
       expect(yield* resolveSimulatorStream(`${payload}A.${signature}`)).toBeNull();
@@ -105,6 +109,51 @@ describe("SimulatorStreamAccess", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.effect("warns about unavailable signing state without logging a signed token", () => {
+    const messages: Array<unknown> = [];
+    const annotations: Array<Readonly<Record<string, unknown>>> = [];
+    const logger = Logger.make<unknown, void>(({ fiber, message }) => {
+      if (Array.isArray(message)) {
+        messages.push(...message);
+      } else {
+        messages.push(message);
+      }
+      annotations.push(fiber.getRef(References.CurrentLogAnnotations));
+    });
+    const unavailableStore = ServerSecretStore.ServerSecretStore.of({
+      get: () => Effect.die("unused secret-store operation"),
+      set: () => Effect.die("unused secret-store operation"),
+      create: () => Effect.die("unused secret-store operation"),
+      getOrCreateRandom: () =>
+        Effect.fail(
+          new ServerSecretStore.SecretStoreReadError({
+            resource: "simulator stream signing key",
+            cause: new Error("unavailable"),
+          }),
+        ),
+      remove: () => Effect.die("unused secret-store operation"),
+    });
+
+    return Effect.gen(function* () {
+      const { token } = yield* issue();
+      expect(yield* resolveSimulatorStream(token)).toBeNull();
+      expect(messages).toContain("Simulator stream signing key unavailable.");
+      expect(annotations).toContainEqual({ errorTag: "SecretStoreReadError" });
+      expect(
+        [...messages, ...annotations.flatMap((annotation) => Object.values(annotation))]
+          .map(String)
+          .join("\n"),
+      ).not.toContain(token);
+    }).pipe(
+      Effect.provide(
+        Layer.merge(
+          Layer.succeed(ServerSecretStore.ServerSecretStore, unavailableStore),
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
+      ),
+    );
+  });
+
   it.effect("keeps stream claims bound to the lease generation", () =>
     Effect.gen(function* () {
       const { token } = yield* issue();
@@ -122,7 +171,7 @@ describe("SimulatorStreamAccess", () => {
       expect(
         matchesSimulatorStreamBinding(claims, {
           ...binding,
-          udid: SimulatorUdid.make("other-device"),
+          udid: SimulatorUdid.make("22222222-2222-4222-8222-222222222222"),
         }),
       ).toBe(false);
     }).pipe(Effect.provide(testLayer)),

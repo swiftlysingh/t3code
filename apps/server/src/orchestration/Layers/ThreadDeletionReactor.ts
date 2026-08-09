@@ -17,6 +17,11 @@ import {
 import { forkParked } from "../../serverActivation.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
+type ThreadSimulatorManager = Pick<SimulatorManager.SimulatorManager["Service"], "releaseThread">;
+type ThreadSimulatorAutomationCloser = Pick<
+  SimulatorAutomation.SimulatorAutomation["Service"],
+  "closeThread"
+>;
 
 export const logCleanupCauseUnlessInterrupted = <R, E>({
   effect,
@@ -38,6 +43,42 @@ export const logCleanupCauseUnlessInterrupted = <R, E>({
       });
     }),
   );
+
+/**
+ * Thread deletion must always hand the lease back to Manager. The automation
+ * child is a best-effort pre-close; a failed child close cannot be allowed to
+ * leave Manager's sidecar and host/device locks allocated.
+ */
+export const releaseThreadAfterAutomationClose = Effect.fn(
+  "ThreadDeletionReactor.releaseThreadAfterAutomationClose",
+)(function* (
+  simulatorManager: ThreadSimulatorManager,
+  simulatorAutomation: ThreadSimulatorAutomationCloser,
+  threadId: ThreadDeletedEvent["payload"]["threadId"],
+) {
+  return yield* simulatorAutomation.closeThread(threadId).pipe(
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
+      return Effect.logWarning("thread deletion cleanup failed to close simulator automation", {
+        threadId,
+        cause: Cause.pretty(cause),
+      });
+    }),
+    // Thread deletion can be interrupted while a child shuts down. Release
+    // the Manager-owned lease in the uninterruptible onError finalizer too.
+    Effect.onError(() =>
+      simulatorManager.releaseThread(threadId).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("thread deletion cleanup failed to release Simulator lease", {
+            threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      ),
+    ),
+    Effect.andThen(simulatorManager.releaseThread(threadId)),
+  );
+});
 
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
@@ -62,10 +103,8 @@ const make = Effect.gen(function* () {
 
   const closeThreadSimulator = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
     logCleanupCauseUnlessInterrupted({
-      effect: simulatorAutomation
-        .closeThread(threadId)
-        .pipe(Effect.andThen(simulatorManager.releaseThread(threadId))),
-      message: "thread deletion cleanup skipped Simulator release",
+      effect: releaseThreadAfterAutomationClose(simulatorManager, simulatorAutomation, threadId),
+      message: "thread deletion cleanup failed to release Simulator lease",
       threadId,
     });
 

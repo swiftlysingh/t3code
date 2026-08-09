@@ -10,7 +10,9 @@ The Simulator is a machine-local execution resource owned by the T3 server envir
 server finds an actual CoreSimulator device, reserves it for a thread, and supervises a
 `serve-sim` process that provides the live view. An agent can then build and launch the thread's
 app through a lease-scoped XcodeBuildMCP session. The web and desktop clients display the same
-device and send typed, authenticated input through T3.
+device and send typed, authenticated input through T3. The embedded view is the default: acquiring
+a lease does not open or focus the shared native Simulator.app. A user can explicitly open that
+exact device in Simulator.app from the panel when they need the native UI.
 
 The operating system of the machine running the T3 server determines whether the capability is
 available. A browser or desktop client does not need to run on macOS: a client on Linux or Windows
@@ -21,6 +23,9 @@ The first release intentionally has conservative host capacity:
 
 - one active Simulator lease by default;
 - one live stream by default.
+
+An unsupported host reports `maxActive: 0`; capacity and media expiry values are non-negative
+integers on the wire.
 
 The scheduler and locks are host-wide, so another T3 environment or worktree cannot mutate the
 same device behind the first environment's back. A request that arrives while capacity is full is
@@ -123,9 +128,16 @@ type SimulatorSession = {
     width: number;
     height: number;
     orientation: string;
-    /** Epoch milliseconds. */
+    /** Non-negative integer epoch milliseconds. */
     expiresAt: number;
   };
+  failure?: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  };
+  createdAt: string;
+  updatedAt: string;
 };
 ```
 
@@ -177,7 +189,9 @@ Acquisition is an event-driven sequence:
 2. Create a generation-fenced starting lease, or return a queued lease when local capacity is full.
 3. Acquire the host-wide capacity and exact-UDID locks.
 4. Start the per-lease `serve-sim` child, which boots the exact device when needed, binds to
-   loopback, and waits for health plus a real frame.
+   loopback, and waits for health plus a real frame. Its private environment suppresses only
+   `serve-sim`'s automatic `open -ga Simulator` invocation, so this step does not focus
+   Simulator.app.
 5. Publish a ready session and a short-lived media capability to the client.
 6. When the agent first invokes a build or semantic action, resolve the authenticated thread's
    worktree and lazily start its lease-scoped XcodeBuildMCP child.
@@ -200,8 +214,9 @@ The server starts at most one lazy `XcodeBuildMCP@2.6.2` child per Simulator lea
 official MCP stdio client. The child is created on the first automation call, scoped to the
 authenticated thread's worktree, and serialized per lease. The `serve-sim` child starts on demand
 when a lease is acquired and is ready to provide the live frame; the XcodeBuildMCP child starts on
-the first build or UI-automation call. Neither process needs to be managed separately by the user,
-and both are stopped during lease/server cleanup. Calls carry
+the first build or UI-automation call. Both children are configured for the embedded viewer rather
+than automatically opening Simulator.app. Neither process needs to be managed separately by the
+user, and both are stopped during lease/server cleanup. Calls carry
 the exact project/workspace, scheme, configuration, DerivedData location, bundle identifier, and
 Simulator UDID when those arguments apply. Session defaults are not shared between threads.
 
@@ -229,6 +244,12 @@ only as a supervised child for a lease. The child binds to `127.0.0.1` on an all
 owned through its captured `ChildProcess` handle and PID; the surrounding host lock separately
 records the T3 owner process-start identity. T3 never uses a broad name/path kill, the upstream
 global `--kill` behavior, or a stale state file to terminate an unknown process.
+
+`serve-sim@0.1.45` automatically invokes `open -ga Simulator` during startup. T3 prepends a
+lease-private `open` shim to that child process's `PATH`; it no-ops exactly that argv and delegates
+every other `open` call to `/usr/bin/open`. The shim directory is removed when the child exits or
+is stopped. It does not change the T3 server's environment or suppress the panel's explicit
+`Open in Simulator.app` action, which launches Simulator.app with the leased UDID.
 
 The sidecar helpers used by the supervisor are intentionally narrow:
 
@@ -289,12 +310,12 @@ The shared web surface is the product UI, and desktop receives it through the de
 panel shows:
 
 - host capability and an explicit unsupported reason;
-- device name, runtime, exact UDID, and lease owner state;
-- queued position and host capacity;
-- queued, starting, ready, failed, and releasing states;
-- live MJPEG video with reconnect handling;
+- a compact ready rail with device name/runtime, stream reconnect, explicit native open, session
+  details, device-ID copy, and release actions;
+- queued, starting, ready, and failed states;
+- live MJPEG video with reconnect handling as the primary panel content;
 - bounded pointer, wheel, keyboard, Home, and orientation controls;
-- stream reconnect status, refresh, and an explicit release action.
+- device and lease details on demand rather than beside the live screen.
 
 The panel is same-origin with the T3 server's authenticated connection. It does not embed a direct
 `serve-sim` URL, depend on an Electron-only bridge, or require a client-side macOS API. A remote

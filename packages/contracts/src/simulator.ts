@@ -9,9 +9,14 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 
-export const SimulatorUdid = TrimmedNonEmptyString.check(Schema.isMaxLength(256)).pipe(
-  Schema.brand("SimulatorUdid"),
-);
+// CoreSimulator identifiers are UUID-shaped, but CoreSimulator does not promise
+// RFC 4122 version or variant bits for every device it returns.
+const CORE_SIMULATOR_UDID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const SimulatorUdid = TrimmedNonEmptyString.check(
+  Schema.isPattern(CORE_SIMULATOR_UDID_PATTERN),
+).pipe(Schema.brand("SimulatorUdid"));
 export type SimulatorUdid = typeof SimulatorUdid.Type;
 
 export const SimulatorLeaseId = TrimmedNonEmptyString.check(Schema.isMaxLength(256)).pipe(
@@ -45,7 +50,7 @@ export const SimulatorCapabilities = Schema.Struct({
   liveStreaming: Schema.Boolean,
   humanInput: Schema.Boolean,
   agentAutomation: Schema.Boolean,
-  maxActive: PositiveInt,
+  maxActive: NonNegativeInt,
   reason: Schema.NullOr(SimulatorCapabilityReason),
 });
 export type SimulatorCapabilities = typeof SimulatorCapabilities.Type;
@@ -77,7 +82,7 @@ export const SimulatorMediaSession = Schema.Struct({
   width: NonNegativeInt,
   height: NonNegativeInt,
   orientation: SimulatorOrientation,
-  expiresAt: Schema.Number,
+  expiresAt: NonNegativeInt,
 });
 export type SimulatorMediaSession = typeof SimulatorMediaSession.Type;
 
@@ -180,10 +185,15 @@ export const SimulatorOrientationInput = Schema.Struct({
   orientation: SimulatorOrientation,
 });
 
+const SimulatorScrollDelta = Schema.Number.check(
+  Schema.isFinite(),
+  Schema.isBetween({ minimum: -120, maximum: 120 }),
+);
+
 export const SimulatorScrollInput = Schema.Struct({
   type: Schema.Literal("scroll"),
-  dx: Schema.Number,
-  dy: Schema.Number,
+  dx: SimulatorScrollDelta,
+  dy: SimulatorScrollDelta,
   x: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
   y: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
 });

@@ -428,6 +428,9 @@ const PreviewPanel = lazy(() =>
 );
 const DiffPanel = lazy(() => import("./DiffPanel"));
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
+const SimulatorPanel = lazy(() =>
+  import("./simulator/SimulatorPanel").then((module) => ({ default: module.SimulatorPanel })),
+);
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
@@ -6093,7 +6096,9 @@ function ChatViewContent(props: ChatViewProps) {
         threadId={activeThreadRef?.threadId ?? null}
       />
     ) : activeRightPanelSurface?.kind === "simulator" && activeThreadRef ? (
-      <SimulatorPanel key={activeThreadKey ?? "simulator"} threadRef={activeThreadRef} />
+      <Suspense fallback={null}>
+        <SimulatorPanel key={activeThreadKey ?? "simulator"} threadRef={activeThreadRef} />
+      </Suspense>
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
       activeWorkspaceRoot ? (

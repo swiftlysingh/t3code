@@ -20,8 +20,11 @@ const XCODE_BUILD_MCP_WORKFLOWS = "simulator,ui-automation,debugging";
 const SIMULATOR_UDID_PATTERN = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
 const DEFAULT_TERMINATE_TIMEOUT_MS = 30_000;
 const execFileAsync = promisify(execFile);
-const require = createRequire(import.meta.url);
-const XCODE_BUILD_MCP_CLI = require.resolve("xcodebuildmcp");
+
+const resolveXcodeBuildMcpCli = (): string => {
+  const require = createRequire(import.meta.url);
+  return require.resolve("xcodebuildmcp");
+};
 
 /**
  * The subset of an MCP transport exposed by StdioClientTransport that this
@@ -620,9 +623,22 @@ export class XcodeBuildMcpClient {
     if (this.#connected && this.#client !== undefined) return this.#client;
 
     const command = this.#options.command ?? process.execPath;
-    const childArgs = this.#options.npxArgs
-      ? [...this.#options.npxArgs]
-      : [XCODE_BUILD_MCP_CLI, "mcp"];
+    let childArgs: Array<string>;
+    if (this.#options.npxArgs !== undefined) {
+      childArgs = [...this.#options.npxArgs];
+    } else {
+      let cli: string;
+      try {
+        cli = resolveXcodeBuildMcpCli();
+      } catch (cause) {
+        throw new XcodeBuildMcpError(
+          "connection",
+          `XcodeBuildMCP ${XCODE_BUILD_MCP_VERSION} is unavailable. Install the iOS simulator dependencies on macOS before using this workflow.`,
+          { cause },
+        );
+      }
+      childArgs = [cli, "mcp"];
+    }
     const environment = {
       ...defaultEnvironment({
         ...process.env,

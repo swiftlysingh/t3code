@@ -14,7 +14,6 @@ import {
   SimulatorUdid,
   ThreadId,
   type SimulatorCapabilities,
-  type SimulatorEvent,
   type SimulatorSession,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -92,157 +91,89 @@ const makeReadySession = (thread: ThreadId): SimulatorSession => ({
   updatedAt: "2026-08-09T00:00:00.000Z",
 });
 
-const automationCalls: Array<{ readonly operation: string; readonly input: unknown }> = [];
+const makeTestRuntime = () => {
+  const automationCalls: Array<{ readonly operation: string; readonly input: unknown }> = [];
+  let session: SimulatorSession | null = null;
 
-const TestSimulatorManagerLayer = Layer.succeed(
-  SimulatorManager.SimulatorManager,
-  (() => {
-    let session: SimulatorSession | null = null;
-    const service: SimulatorManager.SimulatorManager["Service"] = {
-      capabilities: Effect.succeed(simulatorCapabilities),
-      list: () =>
-        Effect.succeed({
-          capabilities: simulatorCapabilities,
-          devices: [simulatorDevice],
-          sessions: session === null ? [] : [session],
-        }),
-      acquire: (input) =>
-        Effect.gen(function* () {
-          if (input.udid !== simulatorUdid) {
-            return yield* new SimulatorDeviceNotFoundError({ udid: input.udid });
-          }
-          if (session !== null && session.threadId !== input.threadId) {
-            return yield* new SimulatorLeaseNotFoundError({
-              threadId: input.threadId,
-              leaseId: session.leaseId,
-            });
-          }
-          session ??= makeReadySession(input.threadId);
-          return { session };
-        }),
-      open: () => Effect.succeed({ opened: true }),
-      status: (input) =>
-        Effect.gen(function* () {
-          if (
-            input.leaseId !== undefined &&
-            (session === null ||
-              session.leaseId !== input.leaseId ||
-              session.threadId !== input.threadId)
-          ) {
-            return yield* new SimulatorLeaseNotFoundError({
-              threadId: input.threadId,
-              leaseId: input.leaseId,
-            });
-          }
-          return {
-            capabilities: simulatorCapabilities,
+  const simulatorManagerLayer = Layer.mock(SimulatorManager.SimulatorManager)({
+    capabilities: Effect.succeed(simulatorCapabilities),
+    list: () =>
+      Effect.succeed({
+        capabilities: simulatorCapabilities,
+        devices: [simulatorDevice],
+        sessions: session === null ? [] : [session],
+      }),
+    acquire: (input) =>
+      Effect.gen(function* () {
+        if (input.udid !== simulatorUdid) {
+          return yield* new SimulatorDeviceNotFoundError({ udid: input.udid });
+        }
+        if (session !== null && session.threadId !== input.threadId) {
+          return yield* new SimulatorLeaseNotFoundError({
             threadId: input.threadId,
-            session: session?.threadId === input.threadId ? session : null,
-          };
-        }),
-      release: (input) =>
-        Effect.gen(function* () {
-          if (
-            session === null ||
+            leaseId: session.leaseId,
+          });
+        }
+        session ??= makeReadySession(input.threadId);
+        return { session };
+      }),
+    status: (input) =>
+      Effect.gen(function* () {
+        if (
+          input.leaseId !== undefined &&
+          (session === null ||
             session.leaseId !== input.leaseId ||
-            session.threadId !== input.threadId
-          ) {
-            return yield* new SimulatorLeaseNotFoundError({
-              threadId: input.threadId,
-              leaseId: input.leaseId,
-            });
-          }
-          if (session.generation !== input.generation) {
-            return yield* new SimulatorLeaseGenerationMismatchError({
-              leaseId: input.leaseId,
-              expectedGeneration: session.generation,
-              receivedGeneration: input.generation,
-            });
-          }
-          session = null;
-          return { released: true, leaseId: input.leaseId, generation: input.generation };
-        }),
-      releaseThread: (thread) =>
-        Effect.sync(() => {
-          if (session?.threadId === thread) session = null;
-        }),
-      sendInput: () => Effect.succeed({ accepted: true }),
-      resolveStream: () => Effect.succeed(null),
-      events: Stream.empty,
-      subscribeEvents: Effect.die("unused in MCP registration tests"),
-    };
-    return service;
-  })(),
-);
+            session.threadId !== input.threadId)
+        ) {
+          return yield* new SimulatorLeaseNotFoundError({
+            threadId: input.threadId,
+            leaseId: input.leaseId,
+          });
+        }
+        return {
+          capabilities: simulatorCapabilities,
+          threadId: input.threadId,
+          session: session?.threadId === input.threadId ? session : null,
+        };
+      }),
+    release: (input) =>
+      Effect.gen(function* () {
+        if (
+          session === null ||
+          session.leaseId !== input.leaseId ||
+          session.threadId !== input.threadId
+        ) {
+          return yield* new SimulatorLeaseNotFoundError({
+            threadId: input.threadId,
+            leaseId: input.leaseId,
+          });
+        }
+        if (session.generation !== input.generation) {
+          return yield* new SimulatorLeaseGenerationMismatchError({
+            leaseId: input.leaseId,
+            expectedGeneration: session.generation,
+            receivedGeneration: input.generation,
+          });
+        }
+        session = null;
+        return { released: true, leaseId: input.leaseId, generation: input.generation };
+      }),
+  });
 
-const TestSimulatorAutomationLayer = Layer.succeed(
-  SimulatorAutomation.SimulatorAutomation,
-  SimulatorAutomation.SimulatorAutomation.of({
-    buildRun: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "buildRun", input });
-        return { built: true };
-      }),
-    launch: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "launch", input });
-        return { launched: true };
-      }),
-    stop: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "stop", input });
-        return { stopped: true };
-      }),
-    snapshotUi: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "snapshotUi", input });
-        return { elements: [] };
-      }),
-    screenshot: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "screenshot", input });
-        return { path: "/tmp/t3-mcp-simulator.png" };
-      }),
+  const simulatorAutomationLayer = Layer.mock(SimulatorAutomation.SimulatorAutomation)({
     tap: (input) =>
       Effect.sync(() => {
         automationCalls.push({ operation: "tap", input });
         return { tapped: true };
       }),
-    typeText: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "typeText", input });
-        return { typed: true };
-      }),
-    waitForUi: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "waitForUi", input });
-        return { matched: true };
-      }),
-    swipe: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "swipe", input });
-        return { swiped: true };
-      }),
-    closeLease: (input) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "closeLease", input });
-      }),
     closeSession: (input) =>
       Effect.sync(() => {
         automationCalls.push({ operation: "closeSession", input });
       }),
-    closeThread: (thread) =>
-      Effect.sync(() => {
-        automationCalls.push({ operation: "closeThread", input: thread });
-      }),
-    closeAll: Effect.void,
-  }),
-);
+  });
 
-const TestProjectionSnapshotQueryLayer = Layer.succeed(
-  ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-  {
-    getThreadCheckpointContext: (requestedThreadId: ThreadId) =>
+  const projectionSnapshotQueryLayer = Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+    getThreadCheckpointContext: (requestedThreadId) =>
       Effect.succeed(
         requestedThreadId === threadId
           ? Option.some({
@@ -254,16 +185,21 @@ const TestProjectionSnapshotQueryLayer = Layer.succeed(
             })
           : Option.none(),
       ),
-  } as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"],
-);
+  });
 
-const TestLayer = McpHttpServer.McpToolkitRegistrationLive.pipe(
-  Layer.provideMerge(McpServer.McpServer.layer),
-  Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
-  Layer.provide(TestSimulatorManagerLayer),
-  Layer.provide(TestSimulatorAutomationLayer),
-  Layer.provide(TestProjectionSnapshotQueryLayer),
-);
+  return {
+    automationCalls,
+    layer: McpHttpServer.McpToolkitRegistrationLive.pipe(
+      // These are read by the test body; retain them while keeping the
+      // simulator fakes private to each runtime.
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+      Layer.provide(simulatorManagerLayer),
+      Layer.provide(simulatorAutomationLayer),
+      Layer.provide(projectionSnapshotQueryLayer),
+    ),
+  };
+};
 
 it("normalizes empty successful notification responses to accepted", () => {
   const notificationResponse = McpHttpServer.normalizeMcpHttpResponse(
@@ -277,8 +213,9 @@ it("normalizes empty successful notification responses to accepted", () => {
   expect(resultResponse.status).toBe(200);
 });
 
-it.effect("returns bounded structural preview snapshot failures", () =>
-  Effect.scoped(
+it.effect("returns bounded structural preview snapshot failures", () => {
+  const runtime = makeTestRuntime();
+  return Effect.scoped(
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
@@ -320,8 +257,8 @@ it.effect("returns bounded structural preview snapshot failures", () =>
         },
       });
     }),
-  ).pipe(Effect.provide(TestLayer)),
-);
+  ).pipe(Effect.provide(runtime.layer));
+});
 
 it.effect("terminates HTTP MCP sessions with DELETE", () =>
   Effect.scoped(
@@ -377,8 +314,9 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("registers annotated tools and preserves authenticated request context", () =>
-  Effect.scoped(
+it.effect("registers annotated tools and preserves authenticated request context", () => {
+  const runtime = makeTestRuntime();
+  return Effect.scoped(
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       const broker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
@@ -483,6 +421,21 @@ it.effect("registers annotated tools and preserves authenticated request context
         "ios_wait_for_ui",
         "ios_swipe",
       ];
+      const iosToolNames = [
+        "ios_capabilities",
+        "ios_list_simulators",
+        "ios_session_open",
+        "ios_session_status",
+        "ios_session_close",
+        ...iosAutomationTools,
+      ];
+      for (const name of iosToolNames) {
+        expect(
+          server.tools.find(({ tool }) => tool.name === name)?.tool.outputSchema,
+        ).toMatchObject({
+          type: "object",
+        });
+      }
       for (const name of iosAutomationTools) {
         const tool = server.tools.find(({ tool }) => tool.name === name);
         expect(tool).toBeDefined();
@@ -577,11 +530,12 @@ it.effect("registers annotated tools and preserves authenticated request context
         sessions: [],
       });
     }),
-  ).pipe(Effect.provide(TestLayer)),
-);
+  ).pipe(Effect.provide(runtime.layer));
+});
 
-it.effect("keeps iOS simulator leases scoped to the authenticated invocation thread", () =>
-  Effect.scoped(
+it.effect("keeps iOS simulator leases scoped to the authenticated invocation thread", () => {
+  const runtime = makeTestRuntime();
+  return Effect.scoped(
     Effect.gen(function* () {
       const server = yield* McpServer.McpServer;
       const alternateInvocation = {
@@ -647,7 +601,7 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
       });
       expect(tap.isError).toBe(false);
       expect(tap.structuredContent).toMatchObject({ tapped: true });
-      const tapCall = automationCalls.find((call) => call.operation === "tap");
+      const tapCall = runtime.automationCalls.find((call) => call.operation === "tap");
       expect(tapCall).toBeDefined();
       expect(tapCall?.input).toMatchObject({
         session: {
@@ -673,11 +627,11 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
         leaseId: openedContent.session.leaseId,
         generation: openedContent.session.generation,
       });
-      const closeCall = automationCalls.find((call) => call.operation === "closeSession");
+      const closeCall = runtime.automationCalls.find((call) => call.operation === "closeSession");
       expect(closeCall?.input).toMatchObject({
         threadId: invocation.threadId,
         udid: simulatorUdid,
       });
     }),
-  ).pipe(Effect.provide(TestLayer)),
-);
+  ).pipe(Effect.provide(runtime.layer));
+});

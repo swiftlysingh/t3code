@@ -200,6 +200,10 @@ const simulatorFailure = Schema.Union([
 ]);
 
 const automationFailure = simulatorFailure;
+// XcodeBuildMCP guarantees a structured MCP payload but owns the operation-
+// specific fields. Preserve those fields while still advertising an object
+// output schema to MCP clients.
+const xcodeBuildMcpResult = Schema.Record(Schema.String, Schema.Unknown);
 
 export const IosCapabilitiesTool = Tool.make("ios_capabilities", {
   description:
@@ -273,7 +277,7 @@ export const IosBuildRunTool = automationTool(
     description:
       "Build and run an iOS project or workspace from this authenticated thread's workspace on the leased exact simulator UDID. The server confines paths to the thread workspace and uses isolated derived data.",
     parameters: iosBuildRunInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Build and run on iOS Simulator"),
@@ -284,7 +288,7 @@ export const IosLaunchAppTool = automationTool(
     description:
       "Launch an already-installed iOS app by bundle identifier on the leased exact simulator UDID. Pass the bundle identifier, not a device name or coordinate.",
     parameters: iosLaunchAppInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Launch iOS app"),
@@ -295,7 +299,7 @@ export const IosStopAppTool = automationTool(
     description:
       "Stop an installed iOS app by bundle identifier on the leased exact simulator UDID.",
     parameters: iosStopAppInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Stop iOS app"),
@@ -305,7 +309,7 @@ export const IosSnapshotUiTool = Tool.make("ios_snapshot_ui", {
   description:
     "Return the current semantic accessibility snapshot from the leased exact simulator UDID. Use elementRef values from this snapshot for tap, type, and swipe; raw serve-sim routes are never exposed.",
   parameters: iosSnapshotUiInput,
-  success: Schema.Unknown,
+  success: xcodeBuildMcpResult,
   failure: automationFailure,
   dependencies,
 })
@@ -319,7 +323,7 @@ export const IosScreenshotTool = Tool.make("ios_screenshot", {
   description:
     "Capture the leased exact simulator as a bounded XcodeBuildMCP screenshot artifact. Choose path for a local artifact reference or base64 when the agent needs image data.",
   parameters: iosScreenshotInput,
-  success: Schema.Unknown,
+  success: xcodeBuildMcpResult,
   failure: automationFailure,
   dependencies,
 })
@@ -334,7 +338,7 @@ export const IosTapTool = automationTool(
     description:
       "Tap one semantic accessibility element from ios_snapshot_ui on the leased exact simulator UDID. This tool accepts elementRef only and never accepts coordinates.",
     parameters: iosTapInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Tap iOS accessibility element"),
@@ -345,7 +349,7 @@ export const IosTypeTextTool = automationTool(
     description:
       "Type literal text into one semantic accessibility element from ios_snapshot_ui on the leased exact simulator UDID. This tool accepts elementRef only and never accepts coordinates.",
     parameters: iosTypeTextInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Type into iOS accessibility element"),
@@ -355,7 +359,7 @@ export const IosWaitForUiTool = Tool.make("ios_wait_for_ui", {
   description:
     "Wait for a semantic accessibility condition on the leased exact simulator UDID. Prefer elementRef, identifier, label, role, or text predicates; coordinates and arbitrary code are not accepted.",
   parameters: iosWaitForUiInput,
-  success: Schema.Unknown,
+  success: xcodeBuildMcpResult,
   failure: automationFailure,
   dependencies,
 })
@@ -369,7 +373,7 @@ export const IosSwipeTool = automationTool(
     description:
       "Swipe within one semantic accessibility element from ios_snapshot_ui on the leased exact simulator UDID. This tool accepts withinElementRef and direction only, never coordinates.",
     parameters: iosSwipeInput,
-    success: Schema.Unknown,
+    success: xcodeBuildMcpResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Swipe iOS accessibility container"),

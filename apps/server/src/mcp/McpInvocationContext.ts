@@ -48,8 +48,10 @@ const requireMcpCapabilityImpl = Effect.fn("mcp.requireCapability")(function* (
   capability: McpCapability,
 ) {
   const invocation = yield* McpInvocationContext;
-  if (!invocation.capabilities.has(capability)) {
-    if (capability === "ios-simulator") {
+  if (invocation.capabilities.has(capability)) return invocation;
+
+  switch (capability) {
+    case "ios-simulator":
       return yield* new McpCapabilityUnavailableError({
         capability,
         environmentId: invocation.environmentId,
@@ -57,16 +59,15 @@ const requireMcpCapabilityImpl = Effect.fn("mcp.requireCapability")(function* (
         providerSessionId: invocation.providerSessionId,
         providerInstanceId: invocation.providerInstanceId,
       });
-    }
-    return yield* new PreviewAutomationUnavailableError({
-      capability,
-      environmentId: invocation.environmentId,
-      threadId: invocation.threadId,
-      providerSessionId: invocation.providerSessionId,
-      providerInstanceId: invocation.providerInstanceId,
-    });
+    case "preview":
+      return yield* new PreviewAutomationUnavailableError({
+        capability,
+        environmentId: invocation.environmentId,
+        threadId: invocation.threadId,
+        providerSessionId: invocation.providerSessionId,
+        providerInstanceId: invocation.providerInstanceId,
+      });
   }
-  return invocation;
 });
 
 export function requireMcpCapability(
@@ -75,6 +76,13 @@ export function requireMcpCapability(
 export function requireMcpCapability(
   capability: "ios-simulator",
 ): Effect.Effect<McpInvocationScope, McpCapabilityUnavailableError, McpInvocationContext>;
+export function requireMcpCapability(
+  capability: McpCapability,
+): Effect.Effect<
+  McpInvocationScope,
+  PreviewAutomationUnavailableError | McpCapabilityUnavailableError,
+  McpInvocationContext
+>;
 export function requireMcpCapability(
   capability: McpCapability,
 ): Effect.Effect<

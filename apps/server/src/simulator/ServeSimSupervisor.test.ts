@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { describe, expect, it } from "vite-plus/test";
+import { delimiter } from "node:path";
 
 import {
   encodeServeSimInput,
@@ -11,6 +12,7 @@ import {
   type ServeSimChild,
   type ServeSimFetch,
   type ServeSimReadable,
+  type ServeSimSession,
   type ServeSimWebSocket,
 } from "./ServeSimSupervisor.ts";
 
@@ -35,15 +37,32 @@ class FakeChild implements ServeSimChild {
   readonly stderr = new FakeReadable();
   readonly signals: Array<NodeJS.Signals | undefined> = [];
   readonly #listeners = new Map<"exit" | "error", Array<(...args: unknown[]) => void>>();
+  readonly #exitsOnTerminate: boolean;
+
+  constructor(exitsOnTerminate = true) {
+    this.#exitsOnTerminate = exitsOnTerminate;
+  }
 
   once(event: "exit" | "error", listener: (...args: unknown[]) => void): this {
     this.#listeners.set(event, [...(this.#listeners.get(event) ?? []), listener]);
     return this;
   }
 
+  off(event: "exit" | "error", listener: (...args: unknown[]) => void): this {
+    this.#listeners.set(
+      event,
+      (this.#listeners.get(event) ?? []).filter((candidate) => candidate !== listener),
+    );
+    return this;
+  }
+
+  listenerCount(event: "exit" | "error"): number {
+    return this.#listeners.get(event)?.length ?? 0;
+  }
+
   kill(signal?: NodeJS.Signals): boolean {
     this.signals.push(signal);
-    if (signal === "SIGTERM") this.emitExit(null, "SIGTERM");
+    if (this.#exitsOnTerminate && signal === "SIGTERM") this.emitExit(null, "SIGTERM");
     return true;
   }
 
@@ -63,6 +82,60 @@ class FakeSocket implements ServeSimWebSocket {
 
   close(): void {
     this.closed = true;
+  }
+}
+
+class ThrowingSocket implements ServeSimWebSocket {
+  readonly readyState = 1;
+  closed = false;
+
+  send(_data: Uint8Array): void {
+    throw new Error("write failed");
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+}
+
+class ErrorSocket implements ServeSimWebSocket {
+  readonly readyState = 0;
+  closed = false;
+  readonly #listeners = new Map<"open" | "error" | "close", Array<(event?: unknown) => void>>();
+
+  addEventListener(event: "open" | "error" | "close", listener: (event?: unknown) => void): void {
+    this.#listeners.set(event, [...(this.#listeners.get(event) ?? []), listener]);
+  }
+
+  removeEventListener(
+    event: "open" | "error" | "close",
+    listener: (event?: unknown) => void,
+  ): void {
+    this.#listeners.set(
+      event,
+      (this.#listeners.get(event) ?? []).filter((candidate) => candidate !== listener),
+    );
+  }
+
+  send(_data: Uint8Array): void {}
+
+  close(): void {
+    this.closed = true;
+  }
+
+  emitError(): void {
+    for (const listener of this.#listeners.get("error") ?? []) listener();
+  }
+
+  emitClose(): void {
+    for (const listener of this.#listeners.get("close") ?? []) listener();
+  }
+
+  listenerCount(): number {
+    return Array.from(this.#listeners.values()).reduce(
+      (count, listeners) => count + listeners.length,
+      0,
+    );
   }
 }
 
@@ -128,11 +201,27 @@ describe("ServeSimSupervisor", () => {
     expect(() => encodeServeSimInput({ type: "keyboard", phase: "up", usage: 256 })).toThrow(
       ServeSimInputError,
     );
+    expect(() =>
+      encodeServeSimInput({ type: "orientation", orientation: "diagonal" } as never),
+    ).toThrow(/Unsupported orientation/);
+    expect(() =>
+      encodeServeSimInput({ type: "touch", phase: "tap", x: 0.5, y: 0.5 } as never),
+    ).toThrow(/Unsupported touch phase/);
+    expect(() =>
+      encodeServeSimInput({ type: "keyboard", phase: "press", usage: 4 } as never),
+    ).toThrow(/Unsupported keyboard phase/);
+    expect(() => encodeServeSimInput(null as never)).toThrow(ServeSimInputError);
   });
 
   it("spawns the pinned local serve-sim binary and waits for health, config, and a frame", async () => {
     const child = new FakeChild();
     let shimCleanupCount = 0;
+    const previousSecret = process.env.T3_SIMULATOR_SECRET;
+    const previousNodeOptions = process.env.NODE_OPTIONS;
+    const previousLocale = process.env.LC_T3_SIMULATOR_TEST;
+    process.env.T3_SIMULATOR_SECRET = "not-for-child";
+    process.env.NODE_OPTIONS = "--require=/tmp/attacker.js";
+    process.env.LC_T3_SIMULATOR_TEST = "allowed";
     let invocation:
       | {
           readonly command: string;
@@ -141,57 +230,81 @@ describe("ServeSimSupervisor", () => {
         }
       | undefined;
     const calls: Array<string> = [];
-    const supervisor = new ServeSimSupervisor({
-      allocatePort: async () => 4555,
-      resolveBinary: () => "/worktree/apps/server/node_modules/serve-sim/dist/serve-sim.js",
-      createHeadlessOpenShim: async () => ({
-        path: "/tmp/t3-serve-sim-headless-test",
-        cleanup: async () => {
-          shimCleanupCount += 1;
+    let session: ServeSimSession | undefined;
+    try {
+      const supervisor = new ServeSimSupervisor({
+        allocatePort: async () => 4555,
+        resolveBinary: () => "/worktree/apps/server/node_modules/serve-sim/dist/serve-sim.js",
+        createHeadlessOpenShim: async () => ({
+          path: "/tmp/t3-serve-sim-headless-test",
+          cleanup: async () => {
+            shimCleanupCount += 1;
+          },
+        }),
+        spawn: (command, args, options) => {
+          invocation = { command, args, options };
+          return child;
         },
-      }),
-      spawn: (command, args, options) => {
-        invocation = { command, args, options };
-        return child;
-      },
-      fetch: readyFetch(calls),
-      sleep: async () => undefined,
-      readyTimeoutMs: 100,
-    });
+        fetch: readyFetch(calls),
+        sleep: async () => undefined,
+        readyTimeoutMs: 100,
+      });
 
-    const session = await supervisor.start(udid);
-    expect(invocation?.command).toBe(
-      "/worktree/apps/server/node_modules/serve-sim/dist/serve-sim.js",
-    );
-    expect(invocation?.args).toEqual([
-      udid,
-      "--port",
-      "4555",
-      "--host",
-      "127.0.0.1",
-      "--codec",
-      "mjpeg",
-      "--panes",
-      "none",
-    ]);
-    expect(invocation?.options).toMatchObject({
-      cwd: process.cwd(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const childEnvironment = (invocation?.options as { readonly env?: NodeJS.ProcessEnv }).env;
-    expect(childEnvironment).toBeDefined();
-    expect(childEnvironment?.PATH).toBe(
-      ["/tmp/t3-serve-sim-headless-test", process.env.PATH].filter(Boolean).join(":"),
-    );
-    expect(childEnvironment).not.toHaveProperty("NODE_OPTIONS");
-    expect(childEnvironment).not.toHaveProperty("T3_SIMULATOR_SECRET");
-    expect(calls.map((url) => new URL(url).pathname)).toEqual([
-      `/helper/${udid}/health`,
-      `/helper/${udid}/stream.mjpeg`,
-      `/helper/${udid}/config`,
-    ]);
-    expect(session.config.width).toBe(390);
-    await session.close();
+      session = await supervisor.start(udid);
+      expect(invocation?.command).toBe(
+        "/worktree/apps/server/node_modules/serve-sim/dist/serve-sim.js",
+      );
+      expect(invocation?.args).toEqual([
+        udid,
+        "--port",
+        "4555",
+        "--host",
+        "127.0.0.1",
+        "--codec",
+        "mjpeg",
+        "--panes",
+        "none",
+      ]);
+      expect(invocation?.options).toMatchObject({
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const childEnvironment = (invocation?.options as { readonly env?: NodeJS.ProcessEnv }).env;
+      expect(childEnvironment).toBeDefined();
+      expect(childEnvironment?.PATH).toBe(
+        ["/tmp/t3-serve-sim-headless-test", process.env.PATH].filter(Boolean).join(delimiter),
+      );
+      expect(childEnvironment).toMatchObject({ LC_T3_SIMULATOR_TEST: "allowed" });
+      expect(childEnvironment).not.toHaveProperty("NODE_OPTIONS");
+      expect(childEnvironment).not.toHaveProperty("T3_SIMULATOR_SECRET");
+      const allowedKeys = new Set([
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "DEVELOPER_DIR",
+        "SDKROOT",
+        "LANG",
+        "TERM",
+        "CI",
+      ]);
+      for (const key of Object.keys(childEnvironment ?? {})) {
+        expect(allowedKeys.has(key) || key.startsWith("LC_")).toBe(true);
+      }
+      expect(calls.map((url) => new URL(url).pathname)).toEqual([
+        `/helper/${udid}/health`,
+        `/helper/${udid}/stream.mjpeg`,
+        `/helper/${udid}/config`,
+      ]);
+      expect(session.config.width).toBe(390);
+    } finally {
+      await session?.close();
+      if (previousSecret === undefined) delete process.env.T3_SIMULATOR_SECRET;
+      else process.env.T3_SIMULATOR_SECRET = previousSecret;
+      if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = previousNodeOptions;
+      if (previousLocale === undefined) delete process.env.LC_T3_SIMULATOR_TEST;
+      else process.env.LC_T3_SIMULATOR_TEST = previousLocale;
+    }
     expect(child.signals).toEqual(["SIGTERM"]);
     expect(shimCleanupCount).toBe(1);
   });
@@ -267,6 +380,106 @@ describe("ServeSimSupervisor", () => {
     );
     await session.close();
     expect(socket.closed).toBe(true);
+  });
+
+  it("closes a socket when opening the private input channel fails", async () => {
+    const child = new FakeChild();
+    const socket = new ErrorSocket();
+    const supervisor = new ServeSimSupervisor({
+      allocatePort: async () => 4558,
+      resolveBinary: () => "/serve-sim.js",
+      spawn: () => child,
+      fetch: readyFetch([]),
+      webSocket: () => {
+        queueMicrotask(() => socket.emitError());
+        return socket;
+      },
+      sleep: async () => undefined,
+      readyTimeoutMs: 100,
+      requestTimeoutMs: 100,
+    });
+    const session = await supervisor.start(udid);
+
+    await expect(session.sendInput({ type: "home" })).rejects.toMatchObject({ code: "websocket" });
+    expect(socket.closed).toBe(true);
+    expect(socket.listenerCount()).toBe(0);
+    await session.close();
+  });
+
+  it("does not wait for an input socket that closes before opening", async () => {
+    const child = new FakeChild();
+    const socket = new ErrorSocket();
+    const supervisor = new ServeSimSupervisor({
+      allocatePort: async () => 4560,
+      resolveBinary: () => "/serve-sim.js",
+      spawn: () => child,
+      fetch: readyFetch([]),
+      webSocket: () => {
+        queueMicrotask(() => socket.emitClose());
+        return socket;
+      },
+      sleep: async () => undefined,
+      readyTimeoutMs: 100,
+      requestTimeoutMs: 100,
+    });
+    const session = await supervisor.start(udid);
+
+    await expect(session.sendInput({ type: "home" })).rejects.toMatchObject({ code: "websocket" });
+    expect(socket.closed).toBe(true);
+    expect(socket.listenerCount()).toBe(0);
+    await session.close();
+  });
+
+  it("closes and replaces a socket that fails while sending input", async () => {
+    const child = new FakeChild();
+    const failedSocket = new ThrowingSocket();
+    const replacementSocket = new FakeSocket();
+    const sockets = [failedSocket, replacementSocket];
+    let socketIndex = 0;
+    const supervisor = new ServeSimSupervisor({
+      allocatePort: async () => 4561,
+      resolveBinary: () => "/serve-sim.js",
+      spawn: () => child,
+      fetch: readyFetch([]),
+      webSocket: () => sockets[socketIndex++]!,
+      sleep: async () => undefined,
+      readyTimeoutMs: 100,
+    });
+    const session = await supervisor.start(udid);
+
+    await expect(session.sendInput({ type: "home" })).rejects.toMatchObject({ code: "websocket" });
+    expect(failedSocket.closed).toBe(true);
+    await session.sendInput({ type: "home" });
+    expect(replacementSocket.messages).toHaveLength(1);
+    await session.close();
+  });
+
+  it("removes timed-out child exit waiters", async () => {
+    const child = new FakeChild(false);
+    let shimCleanupCount = 0;
+    const supervisor = new ServeSimSupervisor({
+      allocatePort: async () => 4559,
+      resolveBinary: () => "/serve-sim.js",
+      createHeadlessOpenShim: async () => ({
+        path: "/tmp/t3-serve-sim-headless-test",
+        cleanup: async () => {
+          shimCleanupCount += 1;
+        },
+      }),
+      spawn: () => child,
+      fetch: readyFetch([]),
+      sleep: async () => undefined,
+      readyTimeoutMs: 100,
+      gracefulStopTimeoutMs: 1,
+      forceStopTimeoutMs: 1,
+    });
+    const session = await supervisor.start(udid);
+
+    await expect(session.close()).rejects.toMatchObject({ code: "stop-timeout" });
+    expect(child.listenerCount("exit")).toBe(1);
+    child.emitExit(null, "SIGKILL");
+    await Promise.resolve();
+    expect(shimCleanupCount).toBe(1);
   });
 
   it("reports an unexpected child exit with bounded output tails", async () => {

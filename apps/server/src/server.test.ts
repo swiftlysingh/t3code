@@ -28,6 +28,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
+  type SimulatorCapabilities,
   ThreadId,
   WS_METHODS,
   WsRpcGroup,
@@ -744,7 +745,19 @@ const buildAppUnderTest = (options?: {
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(SimulatorAutomation.SimulatorAutomation)({}),
-          Layer.mock(SimulatorManager.SimulatorManager)({}),
+          Layer.mock(SimulatorManager.SimulatorManager)({
+            capabilities: Effect.succeed({
+              host: { os: "unknown", arch: "other" },
+              platformSupported: false,
+              executionReady: false,
+              deviceEnumeration: false,
+              liveStreaming: false,
+              humanInput: false,
+              agentAutomation: false,
+              maxActive: 0,
+              reason: "unsupported-platform",
+            } satisfies SimulatorCapabilities),
+          }),
           Layer.mock(PreviewManager.PreviewManager)({
             open: () => Effect.die("PreviewManager not stubbed in this test"),
             navigate: () => Effect.die("PreviewManager not stubbed in this test"),

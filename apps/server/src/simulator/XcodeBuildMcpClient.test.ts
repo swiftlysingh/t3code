@@ -137,13 +137,33 @@ describe("XcodeBuildMcpClient", () => {
         T3_SIMULATOR_SECRET: "not-for-child",
         NODE_OPTIONS: "--require=/tmp/attacker.js",
         PATH: "/usr/bin",
+        LC_T3_SIMULATOR_TEST: "allowed",
       },
     );
 
     await client.connect();
-    expect(parameters?.env).toMatchObject({ PATH: "/usr/bin" });
+    expect(parameters?.env).toMatchObject({ PATH: "/usr/bin", LC_T3_SIMULATOR_TEST: "allowed" });
     expect(parameters?.env).not.toHaveProperty("T3_SIMULATOR_SECRET");
     expect(parameters?.env).not.toHaveProperty("NODE_OPTIONS");
+    const allowedKeys = new Set([
+      "PATH",
+      "HOME",
+      "TMPDIR",
+      "DEVELOPER_DIR",
+      "SDKROOT",
+      "LANG",
+      "TERM",
+      "CI",
+      "XCODEBUILDMCP_ENABLED_WORKFLOWS",
+      "XCODEBUILDMCP_DISABLE_XCODE_AUTO_SYNC",
+      "XCODEBUILDMCP_DISABLE_SESSION_DEFAULTS",
+      "XCODEBUILDMCP_MCP_IDLE_TIMEOUT_MS",
+      "XCODEBUILDMCP_SENTRY_DISABLED",
+      "XCODEBUILDMCP_HEADLESS_LAUNCH",
+    ]);
+    for (const key of Object.keys(parameters?.env ?? {})) {
+      expect(allowedKeys.has(key) || key.startsWith("LC_")).toBe(true);
+    }
     await client.close();
   });
 

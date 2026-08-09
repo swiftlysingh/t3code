@@ -10,6 +10,7 @@ import {
   SimulatorReleaseResult,
   SimulatorSendInput,
   SimulatorSession,
+  SimulatorUdid,
 } from "./simulator.ts";
 
 const decodeCapabilities = Schema.decodeUnknownSync(SimulatorCapabilities);
@@ -20,13 +21,15 @@ const decodeOpenInput = Schema.decodeUnknownSync(SimulatorOpenInput);
 const decodeOpenResult = Schema.decodeUnknownSync(SimulatorOpenResult);
 const decodeInput = Schema.decodeUnknownSync(SimulatorSendInput);
 const decodeEvent = Schema.decodeUnknownSync(SimulatorEvent);
+const decodeUdid = Schema.decodeUnknownSync(SimulatorUdid);
 
 const timestamp = "2026-01-01T00:00:00.000Z";
+const simulatorUdid = "A1B2C3D4-E5F6-0000-0000-1D2E3F4A5B6C";
 
 const session = {
   leaseId: "sim-lease-1",
   threadId: "thread-1",
-  udid: "A1B2C3",
+  udid: simulatorUdid,
   generation: 1,
   state: "ready" as const,
   media: {
@@ -79,6 +82,49 @@ describe("SimulatorCapabilities", () => {
       }),
     ).toMatchObject({ platformSupported: false, reason: "unsupported-platform" });
   });
+
+  it("allows zero capacity when execution is unsupported", () => {
+    expect(
+      decodeCapabilities({
+        host: { os: "linux", arch: "x64" },
+        platformSupported: false,
+        executionReady: false,
+        deviceEnumeration: false,
+        liveStreaming: false,
+        humanInput: false,
+        agentAutomation: false,
+        maxActive: 0,
+        reason: "unsupported-platform",
+      }),
+    ).toMatchObject({ maxActive: 0 });
+    expect(() =>
+      decodeCapabilities({
+        host: { os: "linux", arch: "x64" },
+        platformSupported: false,
+        executionReady: false,
+        deviceEnumeration: false,
+        liveStreaming: false,
+        humanInput: false,
+        agentAutomation: false,
+        maxActive: -1,
+        reason: "unsupported-platform",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("SimulatorUdid", () => {
+  it("accepts CoreSimulator hex UUIDs without RFC version or variant bits", () => {
+    expect(decodeUdid(simulatorUdid)).toBe(simulatorUdid);
+    expect(decodeUdid("00000000-0000-0000-0000-000000000000")).toBe(
+      "00000000-0000-0000-0000-000000000000",
+    );
+  });
+
+  it("rejects identifiers that are not UUID-shaped", () => {
+    expect(() => decodeUdid("A1B2C3")).toThrow();
+    expect(() => decodeUdid("A1B2C3D4-E5F6-0000-0000-1D2E3F4A5B6")).toThrow();
+  });
 });
 
 describe("SimulatorSession and results", () => {
@@ -102,6 +148,19 @@ describe("SimulatorSession and results", () => {
     ).toEqual({ threadId: "thread-1", leaseId: "sim-lease-1", generation: 1 });
     expect(decodeOpenResult({ opened: true })).toEqual({ opened: true });
   });
+
+  it("requires a nonnegative integer media expiry", () => {
+    expect(decodeSession(session)).toMatchObject({ media: { expiresAt: 1_800_000_000_000 } });
+    expect(() =>
+      decodeSession({ ...session, media: { ...session.media, expiresAt: -1 } }),
+    ).toThrow();
+    expect(() =>
+      decodeSession({ ...session, media: { ...session.media, expiresAt: 1.5 } }),
+    ).toThrow();
+    expect(() =>
+      decodeSession({ ...session, media: { ...session.media, expiresAt: Number.NaN } }),
+    ).toThrow();
+  });
 });
 
 describe("Simulator input", () => {
@@ -117,6 +176,36 @@ describe("Simulator input", () => {
     expect(() =>
       decodeInput({ ...base, event: { type: "touch", phase: "move", x: 1.1, y: 0.25 } }),
     ).toThrow();
+  });
+
+  it("accepts finite signed scroll deltas in the panel clamp range", () => {
+    const base = {
+      threadId: "thread-1",
+      leaseId: "sim-lease-1",
+      generation: 1,
+    };
+    expect(
+      decodeInput({
+        ...base,
+        event: { type: "scroll", dx: -120, dy: 120, x: 0.5, y: 0.25 },
+      }),
+    ).toMatchObject({ event: { type: "scroll", dx: -120, dy: 120 } });
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(() =>
+        decodeInput({
+          ...base,
+          event: { type: "scroll", dx: value, dy: 0, x: 0.5, y: 0.25 },
+        }),
+      ).toThrow();
+    }
+    for (const value of [-120.1, 120.1]) {
+      expect(() =>
+        decodeInput({
+          ...base,
+          event: { type: "scroll", dx: value, dy: 0, x: 0.5, y: 0.25 },
+        }),
+      ).toThrow();
+    }
   });
 });
 
@@ -135,6 +224,6 @@ describe("SimulatorEvent", () => {
 
     expect(
       decodeEvent({ type: "session", sequence: 2, createdAt: timestamp, session }),
-    ).toMatchObject({ type: "session", sequence: 2, session: { udid: "A1B2C3" } });
+    ).toMatchObject({ type: "session", sequence: 2, session: { udid: simulatorUdid } });
   });
 });

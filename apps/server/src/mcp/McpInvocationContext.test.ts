@@ -9,6 +9,26 @@ import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
+it.effect("returns the invocation scope for every granted capability", () => {
+  const invocation: McpInvocationContext.McpInvocationScope = {
+    environmentId: EnvironmentId.make("environment-1"),
+    threadId: ThreadId.make("thread-1"),
+    providerSessionId: "provider-session-1",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    capabilities: new Set(["preview", "ios-simulator"] as const),
+    issuedAt: 1,
+  };
+
+  return Effect.gen(function* () {
+    for (const capability of ["preview", "ios-simulator"] as const) {
+      const resolved = yield* McpInvocationContext.requireMcpCapability(capability).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      );
+      expect(resolved).toBe(invocation);
+    }
+  });
+});
+
 it.effect("reports the scoped credential context when preview capability is unavailable", () => {
   const invocation: McpInvocationContext.McpInvocationScope = {
     environmentId: EnvironmentId.make("environment-1"),

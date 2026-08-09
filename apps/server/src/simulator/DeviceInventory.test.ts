@@ -5,9 +5,9 @@ import { expect } from "vite-plus/test";
 
 import * as DeviceInventory from "./DeviceInventory.ts";
 
-const bootedUdid = "a0000000-0000-4000-8000-000000000001";
-const shutdownUdid = "a0000000-0000-4000-8000-000000000002";
-const unknownUdid = "a0000000-0000-4000-8000-000000000003";
+const bootedUdid = "A0000000-0000-4000-8000-000000000001";
+const shutdownUdid = "A0000000-0000-4000-8000-000000000002";
+const unknownUdid = "A0000000-0000-4000-8000-000000000003";
 
 const simctlJson = JSON.stringify({
   devices: {
@@ -108,7 +108,7 @@ describe("SimulatorInventory", () => {
 
     return Effect.gen(function* () {
       const found = yield* service.find(bootedUdid);
-      const missing = yield* service.find(bootedUdid.toUpperCase());
+      const missing = yield* service.find(bootedUdid.toLowerCase());
       expect(found.supported).toBe(true);
       expect(found.device?.udid).toBe(bootedUdid);
       expect(missing.device).toBeUndefined();

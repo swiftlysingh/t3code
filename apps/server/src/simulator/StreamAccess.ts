@@ -100,7 +100,14 @@ export const resolveSimulatorStream = Effect.fn("SimulatorStreamAccess.resolve")
     return null;
   }
 
-  const signingSecret = yield* loadSigningSecret.pipe(Effect.orElseSucceed(() => null));
+  const signingSecret = yield* loadSigningSecret.pipe(
+    Effect.tapError((error) =>
+      Effect.logWarning("Simulator stream signing key unavailable.").pipe(
+        Effect.annotateLogs({ errorTag: error._tag }),
+      ),
+    ),
+    Effect.orElseSucceed(() => null),
+  );
   if (!signingSecret) return null;
   if (!timingSafeEqualBase64Url(signature, signPayload(encodedPayload, signingSecret))) {
     return null;

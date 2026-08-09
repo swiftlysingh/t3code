@@ -106,6 +106,14 @@ const safeChildEnvironment = (environment: NodeJS.ProcessEnv): Record<string, st
 };
 
 const simulatorUdidPattern = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
+const SERVE_SIM_TOUCH_PHASES = new Set(["begin", "move", "end"]);
+const SERVE_SIM_KEYBOARD_PHASES = new Set(["down", "up"]);
+const SERVE_SIM_ORIENTATIONS = new Set([
+  "portrait",
+  "portrait_upside_down",
+  "landscape_left",
+  "landscape_right",
+]);
 
 /** The helper routes that may be exposed by a T3 proxy. */
 export const SERVE_SIM_HELPER_ENDPOINTS = [
@@ -199,6 +207,11 @@ export interface ServeSimChild {
   readonly stderr: ServeSimReadable | null | undefined;
   readonly once: (event: "exit" | "error", listener: (...args: unknown[]) => void) => unknown;
   readonly on?: (event: "exit" | "error", listener: (...args: unknown[]) => void) => unknown;
+  readonly removeListener?: (
+    event: "exit" | "error",
+    listener: (...args: unknown[]) => void,
+  ) => unknown;
+  readonly off?: (event: "exit" | "error", listener: (...args: unknown[]) => void) => unknown;
   readonly kill: (signal?: NodeJS.Signals) => boolean;
 }
 
@@ -236,7 +249,15 @@ export interface ServeSimWebSocket {
     event: "open" | "error" | "close",
     listener: (event?: unknown) => void,
   ) => void;
+  readonly removeEventListener?: (
+    event: "open" | "error" | "close",
+    listener: (event?: unknown) => void,
+  ) => void;
   readonly on?: (
+    event: "open" | "error" | "close",
+    listener: (...args: unknown[]) => void,
+  ) => unknown;
+  readonly off?: (
     event: "open" | "error" | "close",
     listener: (...args: unknown[]) => void,
   ) => unknown;
@@ -399,10 +420,16 @@ const ensureInteger = (value: number, label: string, max: number): void => {
 };
 
 const encodeInput = (input: ServeSimInput): Uint8Array => {
+  if (!input || typeof input !== "object") {
+    throw new ServeSimInputError("Unsupported serve-sim input.");
+  }
   let tag: number;
   let payload: Record<string, unknown> | undefined;
   switch (input.type) {
     case "touch":
+      if (!SERVE_SIM_TOUCH_PHASES.has(input.phase)) {
+        throw new ServeSimInputError(`Unsupported touch phase: ${String(input.phase)}.`);
+      }
       ensureNormalized(input.x, "touch.x");
       ensureNormalized(input.y, "touch.y");
       if (input.edge !== undefined) ensureInteger(input.edge, "touch.edge", 255);
@@ -419,11 +446,17 @@ const encodeInput = (input: ServeSimInput): Uint8Array => {
       payload = { button: "home" };
       break;
     case "keyboard":
+      if (!SERVE_SIM_KEYBOARD_PHASES.has(input.phase)) {
+        throw new ServeSimInputError(`Unsupported keyboard phase: ${String(input.phase)}.`);
+      }
       ensureInteger(input.usage, "keyboard.usage", 255);
       tag = 0x06;
       payload = { type: input.phase, usage: input.usage };
       break;
     case "orientation":
+      if (!SERVE_SIM_ORIENTATIONS.has(input.orientation)) {
+        throw new ServeSimInputError(`Unsupported orientation: ${String(input.orientation)}.`);
+      }
       tag = 0x07;
       payload = { orientation: input.orientation };
       break;
@@ -475,13 +508,21 @@ const waitForEvent = (
 ): Promise<boolean> =>
   new Promise((resolve) => {
     let finished = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const onEvent = () => finish(true);
+    const removeListener = () => {
+      if (child.off) child.off(event, onEvent);
+      else child.removeListener?.(event, onEvent);
+    };
     const finish = (value: boolean) => {
       if (finished) return;
       finished = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      removeListener();
       resolve(value);
     };
-    child.once(event, () => finish(true));
-    setTimeout(() => finish(false), timeoutMs);
+    timeout = setTimeout(() => finish(false), timeoutMs);
+    child.once(event, onEvent);
   });
 
 const waitForSocketOpen = (socket: ServeSimWebSocket, timeoutMs: number): Promise<void> => {
@@ -489,30 +530,60 @@ const waitForSocketOpen = (socket: ServeSimWebSocket, timeoutMs: number): Promis
   if (socket.readyState === openState) return Promise.resolve();
   return new Promise((resolve, reject) => {
     let finished = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let removeListeners = () => undefined;
     const finish = (error?: Error) => {
       if (finished) return;
       finished = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      removeListeners();
       if (error) reject(error);
       else resolve();
     };
     const onOpen = () => finish();
     const onError = () =>
       finish(new ServeSimError("websocket", "serve-sim input socket failed to open."));
+    const onClose = () =>
+      finish(new ServeSimError("websocket", "serve-sim input socket closed before opening."));
     if (socket.addEventListener) {
+      removeListeners = () => {
+        socket.removeEventListener?.("open", onOpen);
+        socket.removeEventListener?.("error", onError);
+        socket.removeEventListener?.("close", onClose);
+      };
       socket.addEventListener("open", onOpen);
       socket.addEventListener("error", onError);
+      socket.addEventListener("close", onClose);
     } else if (socket.on) {
+      removeListeners = () => {
+        socket.off?.("open", onOpen);
+        socket.off?.("error", onError);
+        socket.off?.("close", onClose);
+      };
       socket.on("open", onOpen);
       socket.on("error", onError);
+      socket.on("close", onClose);
     } else {
+      removeListeners = () => {
+        if (socket.onopen === onOpen) socket.onopen = null;
+        if (socket.onerror === onError) socket.onerror = null;
+        if (socket.onclose === onClose) socket.onclose = null;
+      };
       socket.onopen = onOpen;
       socket.onerror = onError;
+      socket.onclose = onClose;
     }
-    setTimeout(
-      () =>
-        finish(new ServeSimError("websocket-timeout", "Timed out opening serve-sim input socket.")),
-      timeoutMs,
-    );
+    if (finished) {
+      removeListeners();
+    } else {
+      timeout = setTimeout(
+        () =>
+          finish(
+            new ServeSimError("websocket-timeout", "Timed out opening serve-sim input socket."),
+          ),
+        timeoutMs,
+      );
+    }
   });
 };
 
@@ -911,18 +982,42 @@ export class ServeSimSupervisor {
     if (!active.socketPromise) {
       active.socketPromise = (async () => {
         const socket = this.#webSocket(active.urls.privateWebSocket);
-        await waitForSocketOpen(socket, this.#requestTimeoutMs);
-        active.socket = socket;
-        return socket;
+        try {
+          await waitForSocketOpen(socket, this.#requestTimeoutMs);
+          active.socket = socket;
+          return socket;
+        } catch (error) {
+          // A failed connect is not owned by active.socket yet. Close this
+          // locally-created socket so a timeout/error cannot leak a native
+          // WebSocket connection across retries.
+          closeSocket(socket);
+          throw error;
+        }
       })().catch((error) => {
         active.socketPromise = undefined;
         throw error;
       });
     }
-    const socket = await active.socketPromise;
-    if (socket.readyState !== 1)
+    const socketPromise = active.socketPromise;
+    if (socketPromise === undefined) {
+      throw new ServeSimError("websocket", "serve-sim input socket was not created.");
+    }
+    const socket = await socketPromise;
+    const forgetSocket = () => {
+      if (active.socket === socket) active.socket = undefined;
+      if (active.socketPromise === socketPromise) active.socketPromise = undefined;
+      closeSocket(socket);
+    };
+    if (socket.readyState !== 1) {
+      forgetSocket();
       throw new ServeSimError("websocket", "serve-sim input socket is not open.");
-    socket.send(message);
+    }
+    try {
+      socket.send(message);
+    } catch {
+      forgetSocket();
+      throw new ServeSimError("websocket", "serve-sim input socket failed to send input.");
+    }
   }
 
   async #stopActive(active: ActiveSession): Promise<void> {

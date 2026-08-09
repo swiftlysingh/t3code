@@ -41,6 +41,8 @@ const LOCK_DIRECTORY_MODE = 0o700;
 const OWNER_FILE_MODE = 0o600;
 const OWNER_FILE_NAME = "owner.json";
 const MAX_RECLAIM_ATTEMPTS = 4;
+const PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
+const PROCESS_IDENTITY_MAX_OUTPUT_BYTES = 4 * 1024;
 
 export const SimulatorHostLockMetadata = Schema.Struct({
   version: Schema.Literal(1),
@@ -83,6 +85,12 @@ export interface SimulatorHostLockFileSystem {
     path: string,
     options?: { readonly recursive?: boolean; readonly mode?: number },
   ) => Promise<void>;
+  readonly lstat: (path: string) => Promise<{
+    readonly uid: number;
+    readonly mode: number;
+    readonly isDirectory: () => boolean;
+    readonly isSymbolicLink: () => boolean;
+  }>;
   readonly readFile: (path: string, encoding: "utf8") => Promise<string>;
   readonly writeFile: (
     path: string,
@@ -191,6 +199,7 @@ const defaultFileSystem: SimulatorHostLockFileSystem = {
   mkdir: async (path, options) => {
     await FileSystem.mkdir(path, options);
   },
+  lstat: async (path) => FileSystem.lstat(path),
   readFile: async (path, encoding) => FileSystem.readFile(path, encoding),
   writeFile: async (path, data, options) => {
     await FileSystem.writeFile(path, data, options);
@@ -241,6 +250,9 @@ const defaultProcessStartIdentity = async (
     const result = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
       windowsHide: true,
+      timeout: PROCESS_IDENTITY_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: PROCESS_IDENTITY_MAX_OUTPUT_BYTES,
     });
     const identity = result.stdout.trim();
     return identity.length > 0 ? { state: "present", identity } : { state: "absent" };
@@ -299,6 +311,39 @@ const makeFileSystemError = (
     operation,
     reason: errorReason(error),
   });
+
+const currentUserId = (): number | undefined =>
+  typeof process.getuid === "function" ? process.getuid() : undefined;
+
+const verifyRootDirectory = async (
+  fileSystem: SimulatorHostLockFileSystem,
+  input: Pick<SimulatorHostLockInput, "udid">,
+  rootDirectory: string,
+): Promise<void> => {
+  let stats: Awaited<ReturnType<SimulatorHostLockFileSystem["lstat"]>>;
+  try {
+    stats = await fileSystem.lstat(rootDirectory);
+  } catch (error) {
+    throw makeFileSystemError(input, rootDirectory, "verify-root", error);
+  }
+
+  const uid = currentUserId();
+  const mode = stats.mode & 0o7777;
+  if (
+    uid === undefined ||
+    stats.uid !== uid ||
+    stats.isSymbolicLink() ||
+    !stats.isDirectory() ||
+    mode !== LOCK_DIRECTORY_MODE
+  ) {
+    throw makeFileSystemError(
+      input,
+      rootDirectory,
+      "verify-root",
+      new Error("lock root must be a current-user-owned 0700 directory"),
+    );
+  }
+};
 
 const ownerForError = (
   metadata: SimulatorHostLockMetadata,
@@ -360,18 +405,12 @@ const makeHostLock = (options: SimulatorHostLockOptions = {}): SimulatorHostLock
   const readExistingMetadata = async (
     input: Pick<SimulatorHostLockInput, "udid">,
     path: string,
-  ): Promise<SimulatorHostLockMetadata> => {
+  ): Promise<SimulatorHostLockMetadata | undefined> => {
     let encoded: string;
     try {
       encoded = await fileSystem.readFile(metadataPath(path), "utf8");
     } catch (error) {
-      if (isNotFound(error)) {
-        throw new SimulatorHostLockUnknownOwnerError({
-          udid: input.udid,
-          path,
-          reason: "owner metadata is not present",
-        });
-      }
+      if (isNotFound(error)) return undefined;
       throw makeFileSystemError(input, path, "read-owner", error);
     }
 
@@ -429,8 +468,11 @@ const makeHostLock = (options: SimulatorHostLockOptions = {}): SimulatorHostLock
 
     try {
       await fileSystem.mkdir(rootDirectory, { recursive: true, mode: LOCK_DIRECTORY_MODE });
+      await verifyRootDirectory(fileSystem, input, rootDirectory);
     } catch (error) {
-      throw makeFileSystemError(input, rootDirectory, "create-root", error);
+      throw isLockError(error)
+        ? error
+        : makeFileSystemError(input, rootDirectory, "create-root", error);
     }
 
     const { path, ownerPath } = pathsFor(input.udid);
@@ -443,6 +485,7 @@ const makeHostLock = (options: SimulatorHostLockOptions = {}): SimulatorHostLock
         }
 
         const metadata = await readExistingMetadata(input, path);
+        if (!metadata) continue;
         const ownerState = await processApi.inspect({
           pid: metadata.pid,
           processStartIdentity: metadata.processStartIdentity,
@@ -490,22 +533,31 @@ const makeHostLock = (options: SimulatorHostLockOptions = {}): SimulatorHostLock
         updatedAt: acquiredAt,
       };
       const temporaryOwnerPath = `${ownerPath}.reclaim-${metadata.ownerToken}`;
+      let temporaryOwnerWasWritten = false;
       try {
         await fileSystem.writeFile(temporaryOwnerPath, JSON.stringify(metadata), {
           encoding: "utf8",
           flag: "wx",
           mode: OWNER_FILE_MODE,
         });
+        temporaryOwnerWasWritten = true;
         await fileSystem.rename(temporaryOwnerPath, ownerPath);
       } catch (writeError) {
-        try {
-          await fileSystem.unlink(temporaryOwnerPath);
-        } catch (cleanupError) {
-          if (!isNotFound(cleanupError)) {
-            // Preserve the original failure while making the lock leak
-            // visible through the typed filesystem error.
-            throw makeFileSystemError(input, path, "write-owner-cleanup", cleanupError);
+        if (temporaryOwnerWasWritten || !isAlreadyExists(writeError)) {
+          try {
+            await fileSystem.unlink(temporaryOwnerPath);
+          } catch {
+            // Preserve the original write/rename failure. If the temporary file
+            // cannot be removed, rmdir below will fail closed because the lock
+            // directory is still non-empty.
           }
+        }
+        try {
+          await fileSystem.rmdir(path);
+        } catch {
+          // A non-empty or otherwise inaccessible lock directory must remain
+          // in place so another process cannot claim it unsafely. The caller
+          // still receives the original owner-write failure below.
         }
         throw makeFileSystemError(input, path, "write-owner", writeError);
       }

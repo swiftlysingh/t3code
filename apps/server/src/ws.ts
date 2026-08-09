@@ -50,9 +50,6 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
-  SimulatorLeaseGenerationMismatchError,
-  SimulatorLeaseNotFoundError,
-  SimulatorRuntimeUnavailableError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -92,6 +89,7 @@ import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as SimulatorManager from "./simulator/Manager.ts";
 import * as SimulatorAutomation from "./simulator/Automation.ts";
+import { releaseSimulatorLeaseAfterAutomationClose } from "./simulator/Release.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -2141,41 +2139,7 @@ const makeWsRpcLayer = (
         [WS_METHODS.simulatorRelease]: (input) =>
           observeRpcEffect(
             WS_METHODS.simulatorRelease,
-            Effect.gen(function* () {
-              const current = yield* simulatorManager.status({
-                threadId: input.threadId,
-                leaseId: input.leaseId,
-              });
-              const session = current.session;
-              if (!session) {
-                return yield* Effect.fail(
-                  new SimulatorLeaseNotFoundError({
-                    threadId: input.threadId,
-                    leaseId: input.leaseId,
-                  }),
-                );
-              }
-              if (session.generation !== input.generation) {
-                return yield* Effect.fail(
-                  new SimulatorLeaseGenerationMismatchError({
-                    leaseId: input.leaseId,
-                    expectedGeneration: session.generation,
-                    receivedGeneration: input.generation,
-                  }),
-                );
-              }
-              yield* simulatorAutomation.closeSession(session).pipe(
-                Effect.mapError(
-                  (error) =>
-                    new SimulatorRuntimeUnavailableError({
-                      leaseId: input.leaseId,
-                      operation: "release",
-                      cause: error.message,
-                    }),
-                ),
-              );
-              return yield* simulatorManager.release(input);
-            }),
+            releaseSimulatorLeaseAfterAutomationClose(simulatorManager, simulatorAutomation, input),
             { "rpc.aggregate": "simulator" },
           ),
         [WS_METHODS.simulatorSendInput]: (input) =>

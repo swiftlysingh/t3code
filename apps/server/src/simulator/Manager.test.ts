@@ -28,12 +28,13 @@ import {
   type ServeSimInput,
   type ServeSimStartOptions,
   type ServeSimSession,
+  type ServeSimSupervisorDependencies,
 } from "./ServeSimSupervisor.ts";
 
 const environmentId = EnvironmentId.make("simulator-manager-test-environment");
 const foreignThreadId = ThreadId.make("simulator-manager-foreign-thread");
 const foreignLeaseId = SimulatorLeaseId.make("simulator-manager-foreign-lease");
-const capacityLockUdid = SimulatorUdid.make("t3-host-capacity-slot-1");
+const capacityLockUdid = SimulatorUdid.make("00000000-0000-0000-0000-000000000000");
 
 const deviceA = SimulatorUdid.make("11111111-1111-4111-8111-111111111111");
 const deviceB = SimulatorUdid.make("22222222-2222-4222-8222-222222222222");
@@ -74,6 +75,7 @@ class FakeServeSimSupervisor extends ServeSimSupervisor {
   readonly #gates = new Map<string, Gate<ServeSimSession>>();
   readonly #started = new Map<string, Gate<void>>();
   readonly #cancelled = new Set<string>();
+  #onUnexpectedExit: ServeSimSupervisorDependencies["onUnexpectedExit"];
 
   override start(udid: string, options: ServeSimStartOptions = {}): Promise<ServeSimSession> {
     this.starts.push(udid);
@@ -99,6 +101,24 @@ class FakeServeSimSupervisor extends ServeSimSupervisor {
 
   override async openNative(udid: string): Promise<void> {
     this.opened.push(udid);
+  }
+
+  bindUnexpectedExit(onUnexpectedExit: ServeSimSupervisorDependencies["onUnexpectedExit"]): void {
+    this.#onUnexpectedExit = onUnexpectedExit;
+  }
+
+  exitUnexpectedly(udid: SimulatorUdid, stderrTail = "deterministic serve-sim crash"): void {
+    const onUnexpectedExit = this.#onUnexpectedExit;
+    if (!onUnexpectedExit) throw new Error("unexpected-exit callback was not installed");
+    onUnexpectedExit({
+      udid,
+      pid: 9001,
+      code: 1,
+      signal: null,
+      stdoutTail: "",
+      stderrTail,
+      unexpected: true,
+    });
   }
 
   waitForStart(udid: SimulatorUdid): Promise<void> {
@@ -233,14 +253,20 @@ const hostLayer = (platform: NodeJS.Platform, architecture: NodeJS.Architecture)
     Layer.succeed(HostProcessArchitecture, architecture),
   );
 
-const inventoryLayer = (inventoryDevices: ReadonlyArray<SimulatorDevice>) =>
+const inventoryLayer = (
+  inventoryDevices: ReadonlyArray<SimulatorDevice>,
+  onList: (() => void) | undefined = undefined,
+) =>
   Layer.succeed(
     DeviceInventory.SimulatorInventory,
     DeviceInventory.SimulatorInventory.of({
-      list: Effect.succeed({
-        supported: true,
-        host: { platform: "darwin", architecture: "arm64" },
-        devices: inventoryDevices,
+      list: Effect.sync(() => {
+        onList?.();
+        return {
+          supported: true as const,
+          host: { platform: "darwin" as const, architecture: "arm64" as const },
+          devices: inventoryDevices,
+        };
       }),
       find: (udid) =>
         Effect.succeed({
@@ -275,16 +301,29 @@ const testLayer = (input: {
   readonly platform?: NodeJS.Platform;
   readonly architecture?: NodeJS.Architecture;
   readonly inventoryDevices?: ReadonlyArray<SimulatorDevice>;
+  readonly onInventoryList?: () => void;
+  readonly inventoryCacheNow?: () => number;
+  readonly wireUnexpectedExit?: boolean;
 }) => {
   const dependencies = Layer.mergeAll(
     hostLayer(input.platform ?? "darwin", input.architecture ?? "arm64"),
-    inventoryLayer(input.inventoryDevices ?? devices),
+    inventoryLayer(input.inventoryDevices ?? devices, input.onInventoryList),
     environmentLayer,
     secretStoreLayer,
   );
   return SimulatorManager.layerWithOptions({
     hostLock: input.hostLock.lock,
-    serveSim: input.supervisor,
+    ...(input.wireUnexpectedExit
+      ? {
+          serveSimFactory: (dependencies) => {
+            input.supervisor.bindUnexpectedExit(dependencies.onUnexpectedExit);
+            return input.supervisor;
+          },
+        }
+      : { serveSim: input.supervisor }),
+    ...(input.inventoryCacheNow === undefined
+      ? {}
+      : { inventoryCacheNow: input.inventoryCacheNow }),
   }).pipe(Layer.provide(dependencies));
 };
 
@@ -339,6 +378,39 @@ it.effect(
     }).pipe(Effect.provide(testLayer({ supervisor, hostLock, inventoryDevices: [] })));
   },
 );
+
+it.effect("caches the simctl capability probe for status refreshes but keeps list fresh", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  let cacheNow = 0;
+  let inventoryLists = 0;
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const threadId = freshThreadId();
+
+    yield* manager.status({ threadId });
+    yield* manager.status({ threadId });
+    expect(inventoryLists).toBe(1);
+
+    yield* manager.list({});
+    expect(inventoryLists).toBe(2);
+
+    cacheNow = 1_000;
+    yield* manager.status({ threadId });
+    expect(inventoryLists).toBe(3);
+  }).pipe(
+    Effect.provide(
+      testLayer({
+        supervisor,
+        hostLock,
+        onInventoryList: () => {
+          inventoryLists += 1;
+        },
+        inventoryCacheNow: () => cacheNow,
+      }),
+    ),
+  );
+});
 
 it.effect("validates an exact available UDID before it reserves a lease", () => {
   const supervisor = new FakeServeSimSupervisor();
@@ -465,6 +537,68 @@ it.effect("queues locally, drains after release, and fences the new generation",
     expect(stale._tag).toBe("SimulatorLeaseGenerationMismatchError");
     expect(supervisor.closed).toEqual([deviceA]);
   }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("fails a crashed sidecar, releases its locks, and activates queued work", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const firstThread = freshThreadId();
+    const secondThread = freshThreadId();
+
+    const first = yield* manager.acquire({ threadId: firstThread, udid: deviceA });
+    yield* PubSub.take(events);
+    supervisor.ready(deviceA);
+    yield* PubSub.take(events);
+
+    const second = yield* manager.acquire({ threadId: secondThread, udid: deviceB });
+    expect(second.session).toMatchObject({ state: "queued", queuePosition: 1 });
+    yield* PubSub.take(events);
+
+    supervisor.exitUnexpectedly(deviceA);
+    const failed = yield* PubSub.take(events);
+    expect(failed).toMatchObject({
+      type: "session",
+      sequence: 4,
+      session: {
+        leaseId: first.session.leaseId,
+        state: "failed",
+        failure: {
+          code: "serve-sim-exited",
+          message: "deterministic serve-sim crash",
+          retryable: true,
+        },
+      },
+    });
+    const startedSecond = yield* PubSub.take(events);
+    expect(startedSecond).toMatchObject({
+      type: "session",
+      sequence: 5,
+      session: {
+        leaseId: second.session.leaseId,
+        state: "starting",
+        generation: 2,
+      },
+    });
+
+    supervisor.ready(deviceB);
+    const readySecond = yield* PubSub.take(events);
+    expect(readySecond).toMatchObject({
+      type: "session",
+      sequence: 6,
+      session: { leaseId: second.session.leaseId, state: "ready", generation: 2 },
+    });
+    expect((yield* manager.status({ threadId: firstThread })).session).toMatchObject({
+      leaseId: first.session.leaseId,
+      state: "failed",
+      failure: { code: "serve-sim-exited", retryable: true },
+    });
+    expect(supervisor.closed).toEqual([deviceA]);
+    expect(hostLock.released).toEqual([deviceA, capacityLockUdid]);
+    expect(hostLock.held.size).toBe(2);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock, wireUnexpectedExit: true })));
 });
 
 it.effect("fails a starting session when the host-wide UDID lock is held elsewhere", () => {

@@ -24,7 +24,7 @@ import {
   type SimulatorStatusResult,
   SimulatorThreadLeaseConflictError,
   SimulatorUnsupportedPlatformError,
-  type SimulatorUdid,
+  SimulatorUdid,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -49,6 +49,7 @@ import {
   ServeSimSupervisor,
   type ServeSimInput,
   type ServeSimSession,
+  type ServeSimSupervisorDependencies,
 } from "./ServeSimSupervisor.ts";
 import {
   issueSimulatorStreamUrl,
@@ -57,7 +58,13 @@ import {
 } from "./StreamAccess.ts";
 
 const DEFAULT_MAX_ACTIVE = 1;
-const HOST_CAPACITY_LOCK_UDID = "t3-host-capacity-slot-1" as SimulatorUdid;
+// The host-wide capacity slot participates in the same typed lock metadata as
+// real devices, so keep its sentinel UUID-shaped even though it never reaches
+// CoreSimulator.
+const HOST_CAPACITY_LOCK_UDID = SimulatorUdid.make("00000000-0000-0000-0000-000000000000");
+// Status is polled while the Simulator panel is open. Keep its capability
+// probe brief without making device selection or acquire validation stale.
+const CAPABILITY_INVENTORY_CACHE_TTL_MS = 1_000;
 
 /**
  * This error never crosses the RPC/MCP boundary. It keeps process, lock, and
@@ -85,6 +92,12 @@ export interface SimulatorManagerOptions {
   readonly hostLock?: HostLock.SimulatorHostLock;
   /** Test seam. Production creates one supervised serve-sim child per lease. */
   readonly serveSim?: ServeSimSupervisor;
+  /** Test seam for observing the production unexpected-exit callback. */
+  readonly serveSimFactory?: (
+    dependencies: Pick<ServeSimSupervisorDependencies, "onUnexpectedExit">,
+  ) => ServeSimSupervisor;
+  /** Test seam for the short-lived capability inventory cache. */
+  readonly inventoryCacheNow?: () => number;
 }
 
 export interface SimulatorResolvedStream {
@@ -313,6 +326,11 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const host = { os: hostOs(platform), arch: hostArch(architecture) };
   const platformSupported = platform === "darwin" && architecture === "arm64";
+  const inventoryCacheNow = options.inventoryCacheNow ?? Date.now;
+  let capabilityInventoryCache: {
+    readonly snapshot: DeviceInventory.SimulatorInventorySnapshot;
+    readonly expiresAt: number;
+  } | null = null;
   // The fixed host-capacity lock below intentionally implements one local
   // execution slot. A larger value would lie to callers until there are
   // matching independently-owned cross-process slots.
@@ -331,6 +349,29 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
   let disposed = false;
 
   const events = Stream.fromPubSub(eventsPubSub);
+
+  /**
+   * `status` needs only the capability flags and is refreshed frequently by
+   * the live panel. Cache that `simctl` snapshot for one second. `list` and
+   * `acquire` deliberately continue to query the inventory directly, so a
+   * device picker and an exact-UDID reservation never depend on this cache.
+   */
+  const capabilityInventory = () =>
+    Effect.suspend(() => {
+      const now = inventoryCacheNow();
+      const cached = capabilityInventoryCache;
+      if (cached !== null && cached.expiresAt > now) return Effect.succeed(cached.snapshot);
+      return inventory.list.pipe(
+        Effect.tap((snapshot) =>
+          Effect.sync(() => {
+            capabilityInventoryCache = {
+              snapshot,
+              expiresAt: inventoryCacheNow() + CAPABILITY_INVENTORY_CACHE_TTL_MS,
+            };
+          }),
+        ),
+      );
+    });
 
   const capabilitySnapshot = (
     executionReady: boolean,
@@ -352,7 +393,7 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
   });
 
   const capabilities: SimulatorManager["Service"]["capabilities"] = platformSupported
-    ? inventory.list.pipe(
+    ? capabilityInventory().pipe(
         Effect.map((snapshot) =>
           capabilitySnapshot(snapshot.supported && snapshot.devices.length > 0, snapshot.supported),
         ),
@@ -598,9 +639,11 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
 
   const drainAndActivate = (): Effect.Effect<void> =>
     Effect.suspend(() => {
-      // A retained handle means an external sidecar or exact host lock still
-      // needs cleanup. Do not turn a failed cleanup into a competing queued
-      // launch; the caller can retry the original release safely.
+      // `maxActive` is deliberately one: every retained handle therefore owns
+      // the sole slot or is fail-closed while its sidecar/locks are retried.
+      // Do not turn a failed cleanup into a competing queued launch. If the
+      // host ever gains multiple independently-owned slots, this must become
+      // an exact capacity calculation rather than a map-size guard.
       if (disposed || runtimes.size > 0) return Effect.void;
       return Effect.gen(function* () {
         const updatedAt = yield* nowIso;
@@ -651,11 +694,13 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
     const start = Effect.gen(function* () {
       if (wasCancelled()) return;
 
+      const supervisorDependencies: Pick<ServeSimSupervisorDependencies, "onUnexpectedExit"> = {
+        onUnexpectedExit: (event) => onUnexpectedExit(session, event.stderrTail),
+      };
       const supervisor =
         options.serveSim ??
-        new ServeSimSupervisor({
-          onUnexpectedExit: (event) => onUnexpectedExit(session, event.stderrTail),
-        });
+        options.serveSimFactory?.(supervisorDependencies) ??
+        new ServeSimSupervisor(supervisorDependencies);
       const initialRuntime = runtimes.get(session.leaseId);
       if (!initialRuntime) return;
       runtimes.set(session.leaseId, { ...initialRuntime, supervisor });
