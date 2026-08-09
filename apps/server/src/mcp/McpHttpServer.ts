@@ -22,6 +22,8 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import { IosSimulatorToolkitHandlersLive } from "./toolkits/simulator/handlers.ts";
+import { IosSimulatorToolkit } from "./toolkits/simulator/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -211,9 +213,18 @@ const PreviewSnapshotRegistrationLive = Layer.effectDiscard(registerPreviewSnaps
   Layer.provide(PreviewSnapshotToolkitHandlersLive),
 );
 
+export const IosSimulatorToolkitRegistrationLive = McpServer.toolkit(IosSimulatorToolkit).pipe(
+  Layer.provide(IosSimulatorToolkitHandlersLive),
+);
+
 export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewStandardToolkitRegistrationLive,
   PreviewSnapshotRegistrationLive,
+);
+
+export const McpToolkitRegistrationLive = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  IosSimulatorToolkitRegistrationLive,
 );
 
 const McpTransportLive = McpServer.layerHttp({
@@ -223,4 +234,4 @@ const McpTransportLive = McpServer.layerHttp({
   protocols: [McpProtocol.v2025_06_18],
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = McpToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));

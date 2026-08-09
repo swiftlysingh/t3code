@@ -47,6 +47,10 @@ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
+import * as SimulatorManager from "./simulator/Manager.ts";
+import * as SimulatorAutomation from "./simulator/Automation.ts";
+import { simulatorStreamRouteLayer } from "./simulator/StreamRoute.ts";
+import * as SimulatorInventory from "./simulator/DeviceInventory.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
@@ -329,6 +333,12 @@ const PreviewLayerLive = Layer.empty.pipe(
   Layer.provideMerge(PortScannerLayerLive),
 );
 
+const SimulatorManagerLayerLive = SimulatorManager.layer.pipe(
+  Layer.provide(SimulatorInventory.layer.pipe(Layer.provide(ProcessRunner.layer))),
+);
+
+const SimulatorLayerLive = Layer.mergeAll(SimulatorManagerLayerLive, SimulatorAutomation.layer);
+
 const WorkspaceEntriesLayerLive = WorkspaceEntries.layer.pipe(Layer.provide(WorkspacePaths.layer));
 
 const WorkspaceFileSystemLayerLive = WorkspaceFileSystem.layer.pipe(
@@ -382,7 +392,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  Layer.provideMerge(Layer.mergeAll(SimulatorLayerLive, ProviderInstanceRegistryHydrationLive)),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).
@@ -451,6 +461,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     ),
     otlpTracesProxyRouteLayer,
     assetRouteLayer,
+    simulatorStreamRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),

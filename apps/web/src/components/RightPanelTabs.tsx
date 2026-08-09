@@ -7,6 +7,7 @@ import {
   GitPullRequest,
   Globe2,
   Plus,
+  Smartphone,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -59,6 +60,7 @@ interface RightPanelTabsProps {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddSimulator: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -125,6 +127,7 @@ function RightPanelEmptyState(props: {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
+  onAddSimulator: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -187,6 +190,14 @@ function RightPanelEmptyState(props: {
       disabledReason: SURFACE_DISABLED_REASONS.agents,
       onClick: props.onAddAgents,
       badgeCount: props.liveAgentCount,
+    },
+    {
+      label: "Simulator",
+      description: "Reserve an iOS Simulator lease.",
+      icon: Smartphone,
+      available: true,
+      disabledReason: null,
+      onClick: props.onAddSimulator,
     },
   ] as const;
 
@@ -277,6 +288,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "agents":
       return "Agents";
+    case "simulator":
+      return "Simulator";
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -354,6 +367,8 @@ function SurfaceIcon({
     }
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "simulator":
+      return <Smartphone className="size-3 shrink-0" />;
   }
 }
 
@@ -577,6 +592,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     <Bot />
                     Agents
                   </SurfaceMenuItem>
+                  <SurfaceMenuItem available onClick={props.onAddSimulator}>
+                    <Smartphone />
+                    Simulator
+                  </SurfaceMenuItem>
                 </MenuPopup>
               </Menu>
             ) : null}
@@ -593,6 +612,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
             onAddAgents={props.onAddAgents}
+            onAddSimulator={props.onAddSimulator}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}

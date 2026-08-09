@@ -7,6 +7,8 @@ import * as Stream from "effect/Stream";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
+import * as SimulatorAutomation from "../../simulator/Automation.ts";
+import * as SimulatorManager from "../../simulator/Manager.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ThreadDeletionReactor,
@@ -41,6 +43,8 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
   const terminalManager = yield* TerminalManager.TerminalManager;
+  const simulatorAutomation = yield* SimulatorAutomation.SimulatorAutomation;
+  const simulatorManager = yield* SimulatorManager.SimulatorManager;
 
   const stopProviderSession = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
     logCleanupCauseUnlessInterrupted({
@@ -56,12 +60,22 @@ const make = Effect.gen(function* () {
       threadId,
     });
 
+  const closeThreadSimulator = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
+    logCleanupCauseUnlessInterrupted({
+      effect: simulatorAutomation
+        .closeThread(threadId)
+        .pipe(Effect.andThen(simulatorManager.releaseThread(threadId))),
+      message: "thread deletion cleanup skipped Simulator release",
+      threadId,
+    });
+
   const processThreadDeleted = Effect.fn("processThreadDeleted")(function* (
     event: ThreadDeletedEvent,
   ) {
     const { threadId } = event.payload;
     yield* stopProviderSession(threadId);
     yield* closeThreadTerminals(threadId);
+    yield* closeThreadSimulator(threadId);
   });
 
   const processThreadDeletedSafely = (event: ThreadDeletedEvent) =>

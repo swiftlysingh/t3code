@@ -176,6 +176,21 @@ import {
 import { UsageReadError, UsageSummary, UsageSummaryInput } from "./usage.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
 import {
+  SimulatorAcquireInput,
+  SimulatorAcquireResult,
+  SimulatorCapabilities,
+  SimulatorError,
+  SimulatorEvent,
+  SimulatorListInput,
+  SimulatorListResult,
+  SimulatorReleaseInput,
+  SimulatorReleaseResult,
+  SimulatorSendInput,
+  SimulatorSendInputResult,
+  SimulatorStatusInput,
+  SimulatorStatusResult,
+} from "./simulator.ts";
+import {
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
   SourceControlDiscoveryResult,
@@ -245,6 +260,14 @@ export const WS_METHODS = {
   previewAutomationRespond: "previewAutomation.respond",
   previewAutomationFocusHost: "previewAutomation.focusHost",
 
+  // iOS Simulator control-plane methods
+  simulatorCapabilities: "simulator.capabilities",
+  simulatorList: "simulator.list",
+  simulatorAcquire: "simulator.acquire",
+  simulatorStatus: "simulator.status",
+  simulatorRelease: "simulator.release",
+  simulatorSendInput: "simulator.sendInput",
+
   // Server meta
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
@@ -303,6 +326,7 @@ export const WS_METHODS = {
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
+  subscribeSimulatorEvents: "subscribeSimulatorEvents",
 } as const;
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -815,6 +839,42 @@ export const WsPreviewAutomationFocusHostRpc = Rpc.make(WS_METHODS.previewAutoma
   error: EnvironmentAuthorizationError,
 });
 
+export const WsSimulatorCapabilitiesRpc = Rpc.make(WS_METHODS.simulatorCapabilities, {
+  payload: Schema.Struct({}),
+  success: SimulatorCapabilities,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsSimulatorListRpc = Rpc.make(WS_METHODS.simulatorList, {
+  payload: SimulatorListInput,
+  success: SimulatorListResult,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsSimulatorAcquireRpc = Rpc.make(WS_METHODS.simulatorAcquire, {
+  payload: SimulatorAcquireInput,
+  success: SimulatorAcquireResult,
+  error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
+});
+
+export const WsSimulatorStatusRpc = Rpc.make(WS_METHODS.simulatorStatus, {
+  payload: SimulatorStatusInput,
+  success: SimulatorStatusResult,
+  error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
+});
+
+export const WsSimulatorReleaseRpc = Rpc.make(WS_METHODS.simulatorRelease, {
+  payload: SimulatorReleaseInput,
+  success: SimulatorReleaseResult,
+  error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
+});
+
+export const WsSimulatorSendInputRpc = Rpc.make(WS_METHODS.simulatorSendInput, {
+  payload: SimulatorSendInput,
+  success: SimulatorSendInputResult,
+  error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
+});
+
 export const WsSubscribePreviewEventsRpc = Rpc.make(WS_METHODS.subscribePreviewEvents, {
   payload: Schema.Struct({}),
   success: PreviewEvent,
@@ -946,6 +1006,13 @@ export const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeReso
   stream: true,
 });
 
+export const WsSubscribeSimulatorEventsRpc = Rpc.make(WS_METHODS.subscribeSimulatorEvents, {
+  payload: Schema.Struct({}),
+  success: SimulatorEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
@@ -1027,6 +1094,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewAutomationConnectRpc,
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,
+  WsSimulatorCapabilitiesRpc,
+  WsSimulatorListRpc,
+  WsSimulatorAcquireRpc,
+  WsSimulatorStatusRpc,
+  WsSimulatorReleaseRpc,
+  WsSimulatorSendInputRpc,
   WsSubscribePreviewEventsRpc,
   WsSubscribeDiscoveredLocalServersRpc,
   WsSubscribeServerConfigRpc,
@@ -1034,6 +1107,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeAuthAccessRpc,
   WsSubscribeBackgroundPolicyRpc,
   WsSubscribeResourceTelemetryRpc,
+  WsSubscribeSimulatorEventsRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetWorkflowScriptRpc,
   WsOrchestrationGetTurnDiffRpc,

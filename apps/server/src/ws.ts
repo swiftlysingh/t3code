@@ -50,6 +50,9 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  SimulatorLeaseGenerationMismatchError,
+  SimulatorLeaseNotFoundError,
+  SimulatorRuntimeUnavailableError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -87,6 +90,8 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
+import * as SimulatorManager from "./simulator/Manager.ts";
+import * as SimulatorAutomation from "./simulator/Automation.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -367,6 +372,8 @@ const makeWsRpcLayer = (
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
       const terminalManager = yield* TerminalManager.TerminalManager;
       const previewManager = yield* PreviewManager.PreviewManager;
+      const simulatorManager = yield* SimulatorManager.SimulatorManager;
+      const simulatorAutomation = yield* SimulatorAutomation.SimulatorAutomation;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -2111,6 +2118,66 @@ const makeWsRpcLayer = (
             previewAutomationBroker.focusHost(input),
             { "rpc.aggregate": "preview-automation" },
           ),
+        [WS_METHODS.simulatorCapabilities]: (_input) =>
+          observeRpcEffect(WS_METHODS.simulatorCapabilities, simulatorManager.capabilities, {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorList]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorList, simulatorManager.list(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorAcquire]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorAcquire, simulatorManager.acquire(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorStatus]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorStatus, simulatorManager.status(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorRelease]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.simulatorRelease,
+            Effect.gen(function* () {
+              const current = yield* simulatorManager.status({
+                threadId: input.threadId,
+                leaseId: input.leaseId,
+              });
+              const session = current.session;
+              if (!session) {
+                return yield* Effect.fail(
+                  new SimulatorLeaseNotFoundError({
+                    threadId: input.threadId,
+                    leaseId: input.leaseId,
+                  }),
+                );
+              }
+              if (session.generation !== input.generation) {
+                return yield* Effect.fail(
+                  new SimulatorLeaseGenerationMismatchError({
+                    leaseId: input.leaseId,
+                    expectedGeneration: session.generation,
+                    receivedGeneration: input.generation,
+                  }),
+                );
+              }
+              yield* simulatorAutomation.closeSession(session).pipe(
+                Effect.mapError(
+                  (error) =>
+                    new SimulatorRuntimeUnavailableError({
+                      leaseId: input.leaseId,
+                      operation: "release",
+                      cause: error.message,
+                    }),
+                ),
+              );
+              return yield* simulatorManager.release(input);
+            }),
+            { "rpc.aggregate": "simulator" },
+          ),
+        [WS_METHODS.simulatorSendInput]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorSendInput, simulatorManager.sendInput(input), {
+            "rpc.aggregate": "simulator",
+          }),
         [WS_METHODS.subscribePreviewEvents]: (_input) =>
           observeRpcStream(WS_METHODS.subscribePreviewEvents, previewManager.events, {
             "rpc.aggregate": "preview",
@@ -2255,6 +2322,10 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.subscribeSimulatorEvents]: (_input) =>
+          observeRpcStream(WS_METHODS.subscribeSimulatorEvents, simulatorManager.events, {
+            "rpc.aggregate": "simulator",
+          }),
       });
     }),
   );

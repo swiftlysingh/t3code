@@ -251,6 +251,35 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("keeps Simulator as one thread-scoped singleton surface", () => {
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().open(refB, "simulator");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refB)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+  });
+
+  it("selects a neighboring surface when closing Simulator", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().closeSurface(refA, "simulator");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "agents",
+      surfaces: [{ id: "agents", kind: "agents" }],
+    });
+  });
+
   it("replaces the standalone explorer with peer file surfaces", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");
