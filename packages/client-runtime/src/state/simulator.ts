@@ -51,6 +51,12 @@ export function createSimulatorEnvironmentAtoms<R, E>(
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
     }),
+    open: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:simulator:open",
+      tag: WS_METHODS.simulatorOpen,
+      scheduler: lifecycleScheduler,
+      concurrency: lifecycleConcurrency,
+    }),
     release: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:simulator:release",
       tag: WS_METHODS.simulatorRelease,

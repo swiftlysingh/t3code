@@ -2,7 +2,9 @@ import { it } from "@effect/vitest";
 import {
   EnvironmentId,
   SimulatorDeviceNotFoundError,
+  SimulatorLeaseGenerationMismatchError,
   SimulatorLeaseId,
+  SimulatorLeaseNotFoundError,
   SimulatorRuntimeUnavailableError,
   SimulatorUdid,
   SimulatorUnsupportedPlatformError,
@@ -67,6 +69,7 @@ class FakeServeSimSupervisor extends ServeSimSupervisor {
   readonly starts: string[] = [];
   readonly stopped: string[] = [];
   readonly closed: string[] = [];
+  readonly opened: string[] = [];
   readonly inputs: Array<{ readonly udid: string; readonly input: ServeSimInput }> = [];
   readonly #gates = new Map<string, Gate<ServeSimSession>>();
   readonly #started = new Map<string, Gate<void>>();
@@ -92,6 +95,10 @@ class FakeServeSimSupervisor extends ServeSimSupervisor {
     this.stopped.push(udid);
     this.#cancelled.add(udid);
     this.#gates.get(udid)?.reject(new Error(`serve-sim stopped for ${udid}`));
+  }
+
+  override async openNative(udid: string): Promise<void> {
+    this.opened.push(udid);
   }
 
   waitForStart(udid: SimulatorUdid): Promise<void> {
@@ -546,6 +553,61 @@ it.effect("binds stream resolution and input to the live lease generation", () =
       }),
     );
     expect(invalid).toBeInstanceOf(SimulatorRuntimeUnavailableError);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("opens only the exact ready device owned by the current lease", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const threadId = freshThreadId();
+    const opening = yield* manager.acquire({ threadId, udid: deviceA });
+    yield* PubSub.take(events);
+
+    const starting = yield* Effect.flip(
+      manager.open({
+        threadId,
+        leaseId: opening.session.leaseId,
+        generation: opening.session.generation,
+      }),
+    );
+    expect(starting).toBeInstanceOf(SimulatorRuntimeUnavailableError);
+    expect(supervisor.opened).toEqual([]);
+
+    supervisor.ready(deviceA);
+    yield* PubSub.take(events);
+    const ready = yield* manager.status({ threadId, leaseId: opening.session.leaseId });
+    if (!ready.session) throw new Error("ready session expected");
+
+    expect(
+      yield* manager.open({
+        threadId,
+        leaseId: ready.session.leaseId,
+        generation: ready.session.generation,
+      }),
+    ).toEqual({ opened: true });
+    expect(supervisor.opened).toEqual([deviceA]);
+
+    const stale = yield* Effect.flip(
+      manager.open({
+        threadId,
+        leaseId: ready.session.leaseId,
+        generation: ready.session.generation + 1,
+      }),
+    );
+    expect(stale).toBeInstanceOf(SimulatorLeaseGenerationMismatchError);
+
+    const foreign = yield* Effect.flip(
+      manager.open({
+        threadId: foreignThreadId,
+        leaseId: ready.session.leaseId,
+        generation: ready.session.generation,
+      }),
+    );
+    expect(foreign).toBeInstanceOf(SimulatorLeaseNotFoundError);
+    expect(supervisor.opened).toEqual([deviceA]);
   }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
 });
 

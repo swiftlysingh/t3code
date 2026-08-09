@@ -120,6 +120,7 @@ const TestSimulatorManagerLayer = Layer.succeed(
           session ??= makeReadySession(input.threadId);
           return { session };
         }),
+      open: () => Effect.succeed({ opened: true }),
       status: (input) =>
         Effect.gen(function* () {
           if (

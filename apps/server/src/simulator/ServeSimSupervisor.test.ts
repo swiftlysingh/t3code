@@ -5,6 +5,7 @@ import {
   encodeServeSimInput,
   isAllowedServeSimHelperPath,
   makeServeSimHelperUrls,
+  ServeSimError,
   ServeSimInputError,
   ServeSimSupervisor,
   type ServeSimChild,
@@ -131,6 +132,7 @@ describe("ServeSimSupervisor", () => {
 
   it("spawns the pinned local serve-sim binary and waits for health, config, and a frame", async () => {
     const child = new FakeChild();
+    let shimCleanupCount = 0;
     let invocation:
       | {
           readonly command: string;
@@ -142,6 +144,12 @@ describe("ServeSimSupervisor", () => {
     const supervisor = new ServeSimSupervisor({
       allocatePort: async () => 4555,
       resolveBinary: () => "/worktree/apps/server/node_modules/serve-sim/dist/serve-sim.js",
+      createHeadlessOpenShim: async () => ({
+        path: "/tmp/t3-serve-sim-headless-test",
+        cleanup: async () => {
+          shimCleanupCount += 1;
+        },
+      }),
       spawn: (command, args, options) => {
         invocation = { command, args, options };
         return child;
@@ -172,6 +180,9 @@ describe("ServeSimSupervisor", () => {
     });
     const childEnvironment = (invocation?.options as { readonly env?: NodeJS.ProcessEnv }).env;
     expect(childEnvironment).toBeDefined();
+    expect(childEnvironment?.PATH).toBe(
+      ["/tmp/t3-serve-sim-headless-test", process.env.PATH].filter(Boolean).join(":"),
+    );
     expect(childEnvironment).not.toHaveProperty("NODE_OPTIONS");
     expect(childEnvironment).not.toHaveProperty("T3_SIMULATOR_SECRET");
     expect(calls.map((url) => new URL(url).pathname)).toEqual([
@@ -182,6 +193,21 @@ describe("ServeSimSupervisor", () => {
     expect(session.config.width).toBe(390);
     await session.close();
     expect(child.signals).toEqual(["SIGTERM"]);
+    expect(shimCleanupCount).toBe(1);
+  });
+
+  it("opens the native app only for an explicit exact-UDID request", async () => {
+    const opened: string[] = [];
+    const supervisor = new ServeSimSupervisor({
+      openNativeSimulator: async (exactUdid) => {
+        opened.push(exactUdid);
+      },
+    });
+
+    await supervisor.openNative(udid);
+    expect(opened).toEqual([udid]);
+    await expect(supervisor.openNative("not-a-udid")).rejects.toBeInstanceOf(ServeSimError);
+    expect(opened).toEqual([udid]);
   });
 
   it("observes manager cancellation before a pending port allocation can spawn a child", async () => {

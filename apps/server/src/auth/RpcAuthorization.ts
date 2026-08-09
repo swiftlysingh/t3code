@@ -118,6 +118,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.simulatorList]: AuthOrchestrationReadScope,
   [WS_METHODS.simulatorAcquire]: AuthOrchestrationOperateScope,
   [WS_METHODS.simulatorStatus]: AuthOrchestrationReadScope,
+  [WS_METHODS.simulatorOpen]: AuthOrchestrationOperateScope,
   [WS_METHODS.simulatorRelease]: AuthOrchestrationOperateScope,
   [WS_METHODS.simulatorSendInput]: AuthOrchestrationOperateScope,
   [WS_METHODS.subscribePreviewEvents]: AuthOrchestrationReadScope,

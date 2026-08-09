@@ -5,6 +5,8 @@ import {
   SimulatorAcquireResult,
   SimulatorCapabilities,
   SimulatorEvent,
+  SimulatorOpenInput,
+  SimulatorOpenResult,
   SimulatorReleaseResult,
   SimulatorSendInput,
   SimulatorSession,
@@ -14,6 +16,8 @@ const decodeCapabilities = Schema.decodeUnknownSync(SimulatorCapabilities);
 const decodeSession = Schema.decodeUnknownSync(SimulatorSession);
 const decodeAcquireResult = Schema.decodeUnknownSync(SimulatorAcquireResult);
 const decodeReleaseResult = Schema.decodeUnknownSync(SimulatorReleaseResult);
+const decodeOpenInput = Schema.decodeUnknownSync(SimulatorOpenInput);
+const decodeOpenResult = Schema.decodeUnknownSync(SimulatorOpenResult);
 const decodeInput = Schema.decodeUnknownSync(SimulatorSendInput);
 const decodeEvent = Schema.decodeUnknownSync(SimulatorEvent);
 
@@ -93,6 +97,10 @@ describe("SimulatorSession and results", () => {
       leaseId: "sim-lease-1",
       generation: 1,
     });
+    expect(
+      decodeOpenInput({ threadId: "thread-1", leaseId: "sim-lease-1", generation: 1 }),
+    ).toEqual({ threadId: "thread-1", leaseId: "sim-lease-1", generation: 1 });
+    expect(decodeOpenResult({ opened: true })).toEqual({ opened: true });
   });
 });
 

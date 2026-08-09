@@ -116,6 +116,7 @@ describe("XcodeBuildMcpClient", () => {
       XCODEBUILDMCP_DISABLE_SESSION_DEFAULTS: "1",
       XCODEBUILDMCP_MCP_IDLE_TIMEOUT_MS: "0",
       XCODEBUILDMCP_SENTRY_DISABLED: "1",
+      XCODEBUILDMCP_HEADLESS_LAUNCH: "1",
     });
     expect(parameters?.env).not.toHaveProperty("NODE_OPTIONS");
     expect(fakeClient.calls).toEqual([]);

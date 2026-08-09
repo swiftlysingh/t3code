@@ -2134,6 +2134,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.simulatorStatus, simulatorManager.status(input), {
             "rpc.aggregate": "simulator",
           }),
+        [WS_METHODS.simulatorOpen]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorOpen, simulatorManager.open(input), {
+            "rpc.aggregate": "simulator",
+          }),
         [WS_METHODS.simulatorRelease]: (input) =>
           observeRpcEffect(
             WS_METHODS.simulatorRelease,

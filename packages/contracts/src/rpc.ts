@@ -183,6 +183,8 @@ import {
   SimulatorEvent,
   SimulatorListInput,
   SimulatorListResult,
+  SimulatorOpenInput,
+  SimulatorOpenResult,
   SimulatorReleaseInput,
   SimulatorReleaseResult,
   SimulatorSendInput,
@@ -265,6 +267,7 @@ export const WS_METHODS = {
   simulatorList: "simulator.list",
   simulatorAcquire: "simulator.acquire",
   simulatorStatus: "simulator.status",
+  simulatorOpen: "simulator.open",
   simulatorRelease: "simulator.release",
   simulatorSendInput: "simulator.sendInput",
 
@@ -863,6 +866,12 @@ export const WsSimulatorStatusRpc = Rpc.make(WS_METHODS.simulatorStatus, {
   error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
 });
 
+export const WsSimulatorOpenRpc = Rpc.make(WS_METHODS.simulatorOpen, {
+  payload: SimulatorOpenInput,
+  success: SimulatorOpenResult,
+  error: Schema.Union([SimulatorError, EnvironmentAuthorizationError]),
+});
+
 export const WsSimulatorReleaseRpc = Rpc.make(WS_METHODS.simulatorRelease, {
   payload: SimulatorReleaseInput,
   success: SimulatorReleaseResult,
@@ -1098,6 +1107,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSimulatorListRpc,
   WsSimulatorAcquireRpc,
   WsSimulatorStatusRpc,
+  WsSimulatorOpenRpc,
   WsSimulatorReleaseRpc,
   WsSimulatorSendInputRpc,
   WsSubscribePreviewEventsRpc,

@@ -11,9 +11,11 @@
  * request to an arbitrary serve-sim path and never uses `serve-sim --kill`.
  */
 import { createRequire } from "node:module";
-import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 const SERVE_SIM_VERSION = "0.1.45";
 const LOOPBACK_HOST = "127.0.0.1";
@@ -38,6 +40,60 @@ const SAFE_CHILD_ENVIRONMENT_KEYS = new Set([
   "TERM",
   "CI",
 ]);
+
+/**
+ * serve-sim 0.1.45 unconditionally runs `open -ga Simulator` while booting a
+ * device. T3 owns the browser stream, so opening the shared native
+ * Simulator.app is surprising (and can steal focus from another project).
+ * The shim is prepended to the child PATH and suppresses only that exact argv;
+ * any other `open` invocation is forwarded to the system binary unchanged.
+ */
+export interface ServeSimHeadlessOpenShim {
+  readonly path: string;
+  readonly cleanup: () => Promise<void>;
+}
+
+const createHeadlessOpenShim = async (): Promise<ServeSimHeadlessOpenShim> => {
+  const directory = await mkdtemp(join(tmpdir(), "t3-serve-sim-headless-"));
+  const openPath = join(directory, "open");
+  try {
+    await writeFile(
+      openPath,
+      [
+        "#!/bin/sh",
+        'if [ "$#" -eq 2 ] && [ "$1" = "-ga" ] && [ "$2" = "Simulator" ]; then',
+        "  exit 0",
+        "fi",
+        'exec /usr/bin/open "$@"',
+        "",
+      ].join("\n"),
+      { encoding: "utf8", mode: 0o700 },
+    );
+    // `mode` is honored by Node and Bun, but chmod makes this explicit for
+    // filesystems that apply a restrictive umask to temporary files.
+    await chmod(openPath, 0o700);
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+  return {
+    path: directory,
+    cleanup: () => rm(directory, { recursive: true, force: true }),
+  };
+};
+
+const openNativeSimulator = (udid: string): Promise<void> =>
+  new Promise((resolve, reject) => {
+    execFile(
+      "/usr/bin/open",
+      ["-a", "Simulator", "--args", "-CurrentDeviceUDID", udid],
+      { timeout: 10_000 },
+      (error) => {
+        if (error) reject(error);
+        else resolve();
+      },
+    );
+  });
 
 const safeChildEnvironment = (environment: NodeJS.ProcessEnv): Record<string, string> => {
   const allowed: Record<string, string> = {};
@@ -194,6 +250,10 @@ export interface ServeSimSupervisorDependencies {
   readonly fetch?: ServeSimFetch;
   readonly webSocket?: ServeSimWebSocketFactory;
   readonly resolveBinary?: () => string;
+  /** Test seam for the temporary PATH shim that suppresses native Simulator.app. */
+  readonly createHeadlessOpenShim?: () => Promise<ServeSimHeadlessOpenShim>;
+  /** Test seam for the explicit native Simulator.app action. */
+  readonly openNativeSimulator?: (udid: string) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly readyTimeoutMs?: number;
@@ -532,6 +592,7 @@ interface ActiveSession {
   readonly child: ServeSimChild;
   readonly stdout: BoundedTail;
   readonly stderr: BoundedTail;
+  readonly headlessOpenShim: ServeSimHeadlessOpenShim;
   config: ServeSimConfig;
   socket: ServeSimWebSocket | undefined;
   socketPromise: Promise<ServeSimWebSocket> | undefined;
@@ -547,6 +608,8 @@ export class ServeSimSupervisor {
   readonly #fetch: ServeSimFetch;
   readonly #webSocket: ServeSimWebSocketFactory;
   readonly #resolveBinary: () => string;
+  readonly #createHeadlessOpenShim: () => Promise<ServeSimHeadlessOpenShim>;
+  readonly #openNativeSimulator: (udid: string) => Promise<void>;
   readonly #now: () => number;
   readonly #sleep: (milliseconds: number) => Promise<void>;
   readonly #readyTimeoutMs: number;
@@ -564,6 +627,8 @@ export class ServeSimSupervisor {
     this.#fetch = dependencies.fetch ?? defaultFetch;
     this.#webSocket = dependencies.webSocket ?? defaultWebSocket;
     this.#resolveBinary = dependencies.resolveBinary ?? resolveServeSimBinary;
+    this.#createHeadlessOpenShim = dependencies.createHeadlessOpenShim ?? createHeadlessOpenShim;
+    this.#openNativeSimulator = dependencies.openNativeSimulator ?? openNativeSimulator;
     this.#now = dependencies.now ?? Date.now;
     this.#sleep = dependencies.sleep ?? defaultSleep;
     this.#readyTimeoutMs = dependencies.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
@@ -600,26 +665,67 @@ export class ServeSimSupervisor {
           `Port allocator returned an invalid port: ${port}.`,
         );
       }
-      const child = this.#spawn(
-        this.#resolveBinary(),
-        [
-          udid,
-          "--port",
-          String(port),
-          "--host",
-          LOOPBACK_HOST,
-          "--codec",
-          "mjpeg",
-          "--panes",
-          "none",
-        ],
-        {
-          cwd: process.cwd(),
-          stdio: ["ignore", "pipe", "pipe"],
-          env: safeChildEnvironment(process.env),
-        },
-      );
-      if (!child.pid) throw new ServeSimError("spawn", "serve-sim did not expose a child PID.");
+      let headlessOpenShim: ServeSimHeadlessOpenShim;
+      try {
+        const createdShim = await this.#createHeadlessOpenShim();
+        let cleanedUp = false;
+        headlessOpenShim = {
+          path: createdShim.path,
+          cleanup: async () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            await createdShim.cleanup();
+          },
+        };
+      } catch (error) {
+        throw new ServeSimError(
+          "headless",
+          `Could not prepare the headless serve-sim environment: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      try {
+        throwIfStartAborted(udid, signal);
+      } catch (error) {
+        await headlessOpenShim.cleanup().catch(() => undefined);
+        throw error;
+      }
+
+      const childEnvironment = safeChildEnvironment(process.env);
+      childEnvironment.PATH = [headlessOpenShim.path, childEnvironment.PATH]
+        .filter((value): value is string => value !== undefined && value.length > 0)
+        .join(delimiter);
+
+      let child: ServeSimChild;
+      try {
+        child = this.#spawn(
+          this.#resolveBinary(),
+          [
+            udid,
+            "--port",
+            String(port),
+            "--host",
+            LOOPBACK_HOST,
+            "--codec",
+            "mjpeg",
+            "--panes",
+            "none",
+          ],
+          {
+            cwd: process.cwd(),
+            stdio: ["ignore", "pipe", "pipe"],
+            env: childEnvironment,
+          },
+        );
+      } catch (error) {
+        await headlessOpenShim.cleanup().catch(() => undefined);
+        throw error;
+      }
+      if (!child.pid) {
+        await headlessOpenShim.cleanup().catch(() => undefined);
+        throw new ServeSimError("spawn", "serve-sim did not expose a child PID.");
+      }
 
       const stdout = new BoundedTail();
       const stderr = new BoundedTail();
@@ -635,6 +741,7 @@ export class ServeSimSupervisor {
         child,
         stdout,
         stderr,
+        headlessOpenShim,
         config: {},
         socket: undefined,
         socketPromise: undefined,
@@ -663,6 +770,7 @@ export class ServeSimSupervisor {
           this.#sessions.delete(udid);
           this.#onUnexpectedExit?.(event);
         }
+        void active.headlessOpenShim.cleanup().catch(() => undefined);
       };
       child.once("exit", onExit);
       child.once("error", (error) => {
@@ -707,6 +815,20 @@ export class ServeSimSupervisor {
     } catch (error) {
       if (active.closePromise === closePromise) active.closePromise = undefined;
       throw error;
+    }
+  }
+
+  async openNative(udid: string): Promise<void> {
+    if (!simulatorUdidPattern.test(udid)) {
+      throw new ServeSimError("native-open", "Cannot open an invalid Simulator UDID.");
+    }
+    try {
+      await this.#openNativeSimulator(udid);
+    } catch (error) {
+      throw new ServeSimError(
+        "native-open",
+        `Could not open Simulator.app: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -833,5 +955,6 @@ export class ServeSimSupervisor {
       );
     }
     this.#sessions.delete(active.udid);
+    await active.headlessOpenShim.cleanup().catch(() => undefined);
   }
 }

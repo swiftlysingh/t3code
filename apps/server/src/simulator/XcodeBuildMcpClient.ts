@@ -633,6 +633,10 @@ export class XcodeBuildMcpClient {
       XCODEBUILDMCP_DISABLE_SESSION_DEFAULTS: "1",
       XCODEBUILDMCP_MCP_IDLE_TIMEOUT_MS: "0",
       XCODEBUILDMCP_SENTRY_DISABLED: "1",
+      // T3 renders the simulator through serve-sim. Keep XcodeBuildMCP from
+      // opening the shared native Simulator.app when build/run tools boot the
+      // leased device.
+      XCODEBUILDMCP_HEADLESS_LAUNCH: "1",
     };
     const parameters: StdioServerParameters = {
       command,

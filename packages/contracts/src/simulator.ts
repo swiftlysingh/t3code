@@ -150,6 +150,16 @@ export const SimulatorReleaseResult = Schema.Struct({
 });
 export type SimulatorReleaseResult = typeof SimulatorReleaseResult.Type;
 
+export const SimulatorOpenInput = Schema.Struct({
+  threadId: ThreadId,
+  leaseId: SimulatorLeaseId,
+  generation: PositiveInt,
+});
+export type SimulatorOpenInput = typeof SimulatorOpenInput.Type;
+
+export const SimulatorOpenResult = Schema.Struct({ opened: Schema.Literal(true) });
+export type SimulatorOpenResult = typeof SimulatorOpenResult.Type;
+
 export const SimulatorTouchInput = Schema.Struct({
   type: Schema.Literal("touch"),
   phase: Schema.Literals(["begin", "move", "end"]),

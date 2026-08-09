@@ -12,6 +12,8 @@ import {
   SimulatorLeaseNotFoundError,
   type SimulatorListInput,
   type SimulatorListResult,
+  type SimulatorOpenInput,
+  type SimulatorOpenResult,
   type SimulatorReleaseInput,
   type SimulatorReleaseResult,
   SimulatorRuntimeUnavailableError,
@@ -101,6 +103,9 @@ export class SimulatorManager extends Context.Service<
     readonly status: (
       input: SimulatorStatusInput,
     ) => Effect.Effect<SimulatorStatusResult, SimulatorError>;
+    readonly open: (
+      input: SimulatorOpenInput,
+    ) => Effect.Effect<SimulatorOpenResult, SimulatorError>;
     readonly release: (
       input: SimulatorReleaseInput,
     ) => Effect.Effect<SimulatorReleaseResult, SimulatorError>;
@@ -1074,6 +1079,53 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
     return { accepted: true } satisfies SimulatorSendInputResult;
   });
 
+  const open: SimulatorManager["Service"]["open"] = Effect.fn("SimulatorManager.open")(
+    function* (input) {
+      yield* ensureSupported();
+      const state = yield* SynchronizedRef.get(stateRef);
+      const session = state.sessions.get(input.leaseId);
+      if (!session || session.threadId !== input.threadId) {
+        return yield* new SimulatorLeaseNotFoundError({
+          threadId: input.threadId,
+          leaseId: input.leaseId,
+        });
+      }
+      if (session.generation !== input.generation) {
+        return yield* new SimulatorLeaseGenerationMismatchError({
+          leaseId: input.leaseId,
+          expectedGeneration: session.generation,
+          receivedGeneration: input.generation,
+        });
+      }
+      if (session.state !== "ready") {
+        return yield* new SimulatorRuntimeUnavailableError({
+          leaseId: input.leaseId,
+          operation: "open",
+          cause: `Session is ${session.state}.`,
+        });
+      }
+      const runtime = runtimes.get(input.leaseId);
+      const supervisor = runtime?.supervisor;
+      if (!supervisor) {
+        return yield* new SimulatorRuntimeUnavailableError({
+          leaseId: input.leaseId,
+          operation: "open",
+          cause: "The native Simulator process boundary is unavailable.",
+        });
+      }
+      yield* Effect.tryPromise({
+        try: () => supervisor.openNative(session.udid),
+        catch: (cause): SimulatorRuntimeUnavailableError =>
+          new SimulatorRuntimeUnavailableError({
+            leaseId: input.leaseId,
+            operation: "open",
+            cause: errorText(cause),
+          }),
+      });
+      return { opened: true } satisfies SimulatorOpenResult;
+    },
+  );
+
   const resolveStream: SimulatorManager["Service"]["resolveStream"] = (claims) =>
     SynchronizedRef.get(stateRef).pipe(
       Effect.map((state) => {
@@ -1133,6 +1185,7 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
     list,
     acquire,
     status,
+    open,
     release,
     releaseThread,
     sendInput,

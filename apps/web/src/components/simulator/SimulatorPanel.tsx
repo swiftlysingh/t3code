@@ -11,16 +11,15 @@ import {
   CircleAlert,
   CircleCheck,
   CircleX,
+  CopyIcon,
+  EllipsisIcon,
+  ExternalLinkIcon,
   Home,
-  Keyboard,
+  InfoIcon,
   LoaderCircle,
-  MousePointer2,
   RefreshCw,
   RotateCcw,
   RotateCw,
-  Smartphone,
-  Wifi,
-  WifiOff,
 } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -34,6 +33,9 @@ import {
 } from "react";
 
 import { Button } from "~/components/ui/button";
+import { Collapsible, CollapsiblePanel } from "~/components/ui/collapsible";
+import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
+import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { cn } from "~/lib/utils";
 import { useEnvironmentHttpBaseUrl } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
@@ -94,40 +96,6 @@ function hostLabel(capabilities: SimulatorCapabilities | null): string {
   return `${capabilities.host.os}/${capabilities.host.arch}`;
 }
 
-function statusLabel(state: SimulatorPanelViewState): string {
-  switch (state) {
-    case "loading":
-      return "Loading";
-    case "unsupported":
-      return "Unsupported";
-    case "idle":
-      return "Available";
-    case "queued":
-      return "Queued";
-    case "starting":
-      return "Starting";
-    case "ready":
-      return "Ready";
-    case "failed":
-      return "Needs attention";
-  }
-}
-
-function stateTone(state: SimulatorPanelViewState): string {
-  switch (state) {
-    case "failed":
-    case "unsupported":
-      return "border-destructive/30 bg-destructive/10 text-destructive";
-    case "queued":
-    case "starting":
-      return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300";
-    case "ready":
-      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
-    default:
-      return "border-border bg-muted/50 text-muted-foreground";
-  }
-}
-
 function streamLabel(state: StreamState): string {
   switch (state) {
     case "waiting":
@@ -141,20 +109,6 @@ function streamLabel(state: StreamState): string {
     case "unavailable":
       return "Stream unavailable";
   }
-}
-
-function SimulatorStatusBadge({ state }: { readonly state: SimulatorPanelViewState }) {
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium",
-        stateTone(state),
-      )}
-      data-simulator-status={state}
-    >
-      {statusLabel(state)}
-    </span>
-  );
 }
 
 function DetailRow({
@@ -229,6 +183,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     simulatorEnvironment.events({ environmentId: threadRef.environmentId, input: {} }),
   );
   const acquire = useAtomCommand(simulatorEnvironment.acquire, { reportFailure: false });
+  const openNative = useAtomCommand(simulatorEnvironment.open, { reportFailure: false });
   const release = useAtomCommand(simulatorEnvironment.release, { reportFailure: false });
   const sendInput = useAtomCommand(simulatorEnvironment.sendInput, { reportFailure: false });
   const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(threadRef.environmentId);
@@ -239,6 +194,11 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
   const [streamState, setStreamState] = useState<StreamState>("waiting");
   const [streamAttempt, setStreamAttempt] = useState(0);
   const [optimisticMedia, setOptimisticMedia] = useState<OptimisticSimulatorMedia | null>(null);
+  const [sessionDetailsOpen, setSessionDetailsOpen] = useState(false);
+  const { copyToClipboard, isCopied: hasCopiedDeviceId } = useCopyToClipboard({
+    target: "device ID",
+    onError: (error) => setActionError(error.message),
+  });
   const lastEventSequence = useRef<number | null>(null);
   const releasedLeaseKeys = useRef(new Set<string>());
   const streamRetryTimer = useRef<number | null>(null);
@@ -292,13 +252,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     sessionState: session?.state ?? null,
   });
   const selectedDevice = devices.find((device) => device.udid === selectedUdid) ?? null;
-  const sessions = listQuery.data?.sessions ?? [];
-  const activeCount = sessions.filter(
-    (entry) => entry.state === "starting" || entry.state === "ready",
-  ).length;
-  const queuedCount = sessions.filter((entry) => entry.state === "queued").length;
-  const maxActive = capabilities?.maxActive ?? 0;
-  const capacityPercent = maxActive > 0 ? Math.min(100, (activeCount / maxActive) * 100) : 0;
+  const sessionDevice = session ? devices.find((device) => device.udid === session.udid) : null;
+  const sessionDeviceLabel = sessionDevice
+    ? `${sessionDevice.name} · ${sessionDevice.runtime}`
+    : "iOS Simulator";
   const controlsEnabled = state === "ready" && streamState === "live" && !actionPending;
   const pointerInputEnabled =
     controlsEnabled && streamUrl !== null && mediaDimensions !== undefined;
@@ -323,6 +280,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       return current;
     });
   }, [sessionKey, sessionMedia?.height, sessionMedia?.orientation, sessionMedia?.width]);
+
+  useEffect(() => {
+    setSessionDetailsOpen(false);
+  }, [sessionKey]);
 
   useEffect(() => {
     const next = defaultSelectedDevice(devices);
@@ -513,34 +474,39 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     [listQuery.refresh, release, statusQuery.refresh, threadRef.environmentId, threadRef.threadId],
   );
 
+  const refreshSimulatorStatus = useCallback(() => {
+    setActionError(null);
+    listQuery.refresh();
+    statusQuery.refresh();
+  }, [listQuery.refresh, statusQuery.refresh]);
+
+  const acquireDevice = useCallback(
+    async (udid: string): Promise<boolean> => {
+      const result = await acquire({
+        environmentId: threadRef.environmentId,
+        input: {
+          threadId: threadRef.threadId,
+          udid: SimulatorUdid.make(udid),
+        },
+      });
+      if (result._tag === "Failure") {
+        setActionError(commandErrorMessage(result));
+        return false;
+      }
+      statusQuery.refresh();
+      listQuery.refresh();
+      return true;
+    },
+    [acquire, listQuery.refresh, statusQuery.refresh, threadRef.environmentId, threadRef.threadId],
+  );
+
   const handleAcquire = useCallback(async () => {
     if (!selectedDevice || actionPending || state !== "idle") return;
     setActionError(null);
     setActionPending(true);
-    const result = await acquire({
-      environmentId: threadRef.environmentId,
-      input: {
-        threadId: threadRef.threadId,
-        udid: SimulatorUdid.make(selectedDevice.udid),
-      },
-    });
+    await acquireDevice(selectedDevice.udid);
     setActionPending(false);
-    if (result._tag === "Failure") {
-      setActionError(commandErrorMessage(result));
-      return;
-    }
-    statusQuery.refresh();
-    listQuery.refresh();
-  }, [
-    acquire,
-    actionPending,
-    listQuery.refresh,
-    selectedDevice,
-    state,
-    statusQuery.refresh,
-    threadRef.environmentId,
-    threadRef.threadId,
-  ]);
+  }, [acquireDevice, actionPending, selectedDevice, state]);
 
   const handleRelease = useCallback(async () => {
     if (!session || actionPending) return;
@@ -550,6 +516,43 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     await releaseLease(session, true);
     setActionPending(false);
   }, [actionPending, releaseActiveInput, releaseLease, session]);
+
+  const handleOpenNative = useCallback(async () => {
+    if (!session || session.state !== "ready" || actionPending) return;
+    setActionError(null);
+    setActionPending(true);
+    const result = await openNative({
+      environmentId: threadRef.environmentId,
+      input: {
+        threadId: threadRef.threadId,
+        leaseId: session.leaseId,
+        generation: session.generation,
+      },
+    });
+    setActionPending(false);
+    if (result._tag === "Failure") setActionError(commandErrorMessage(result));
+  }, [actionPending, openNative, session, threadRef.environmentId, threadRef.threadId]);
+
+  const handleRetry = useCallback(async () => {
+    if (actionPending) return;
+    if (!session) {
+      refreshSimulatorStatus();
+      return;
+    }
+    setActionError(null);
+    setActionPending(true);
+    await releaseActiveInput();
+    const released = await releaseLease(session, true);
+    if (released) await acquireDevice(session.udid);
+    setActionPending(false);
+  }, [
+    acquireDevice,
+    actionPending,
+    refreshSimulatorStatus,
+    releaseActiveInput,
+    releaseLease,
+    session,
+  ]);
 
   const handleStreamError = useCallback(() => {
     if (!streamUrl || streamRetryTimer.current !== null) return;
@@ -567,6 +570,21 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
       500 + streamAttempt * 500,
     );
   }, [statusQuery.refresh, streamAttempt, streamUrl]);
+
+  const handleReconnectStream = useCallback(() => {
+    if (!streamUrl) {
+      setActionError("This Simulator session does not have a live stream yet.");
+      return;
+    }
+    if (streamRetryTimer.current !== null) {
+      window.clearTimeout(streamRetryTimer.current);
+      streamRetryTimer.current = null;
+    }
+    setActionError(null);
+    setStreamState("connecting");
+    setStreamAttempt((attempt) => attempt + 1);
+    statusQuery.refresh();
+  }, [statusQuery.refresh, streamUrl]);
 
   const handlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -733,43 +751,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background" data-simulator-panel>
-      <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
-        <div className="mx-auto flex w-full max-w-2xl flex-col gap-3 sm:gap-4">
-          <header className="flex items-start justify-between gap-3">
-            <div className="flex min-w-0 items-start gap-2.5">
-              <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                <Smartphone className="size-4" aria-hidden />
-              </span>
-              <div className="min-w-0">
-                <h2 className="text-sm font-medium text-foreground">Simulator</h2>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  One device, leased to this thread.
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <div aria-live="polite">
-                <SimulatorStatusBadge state={state} />
-              </div>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Refresh Simulator status"
-                title="Refresh status"
-                disabled={state === "loading" || actionPending}
-                onClick={() => {
-                  setActionError(null);
-                  listQuery.refresh();
-                  statusQuery.refresh();
-                }}
-              >
-                <RefreshCw aria-hidden />
-              </Button>
-            </div>
-          </header>
-
+      <div className="min-h-0 flex-1 overflow-y-auto p-2 sm:p-3">
+        <div className="mx-auto flex w-full max-w-2xl flex-col gap-3">
           {state === "loading" ? (
-            <section className="flex items-center gap-2 rounded-lg border border-border/80 bg-card p-4 text-sm text-muted-foreground">
+            <section className="flex items-center gap-2 rounded-lg border border-border/80 bg-card p-3 text-sm text-muted-foreground">
               <LoaderCircle className="size-4" aria-hidden />
               Loading Simulator availability…
             </section>
@@ -790,6 +775,14 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                   </p>
                 </div>
               </div>
+              <Button
+                className="mt-3"
+                variant="destructive-outline"
+                size="xs"
+                onClick={refreshSimulatorStatus}
+              >
+                Retry
+              </Button>
               <dl className="mt-4 grid gap-1.5 border-t border-destructive/20 pt-3">
                 <DetailRow label="Host" value={hostLabel(capabilities)} code />
                 <DetailRow label="Reason" value={capabilities.reason ?? "—"} code />
@@ -807,7 +800,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                 <CircleX className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden />
                 <div className="min-w-0">
                   <h3 className="text-sm font-medium text-destructive">
-                    {session ? "Simulator session failed" : "Simulator unavailable"}
+                    {session ? `Couldn’t start ${sessionDeviceLabel}` : "Simulator unavailable"}
                   </h3>
                   <p className="mt-1 break-words text-xs leading-relaxed text-destructive/80">
                     {failureMessage}
@@ -818,13 +811,10 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                 <Button
                   variant="destructive-outline"
                   size="xs"
-                  onClick={() => {
-                    setActionError(null);
-                    listQuery.refresh();
-                    statusQuery.refresh();
-                  }}
+                  disabled={actionPending}
+                  onClick={() => void handleRetry()}
                 >
-                  Refresh status
+                  {actionPending ? "Retrying…" : "Retry"}
                 </Button>
                 {session ? (
                   <Button
@@ -842,87 +832,52 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
 
           {capabilities && state !== "unsupported" && state !== "failed" ? (
             <>
-              <section
-                className="rounded-lg border border-border/80 bg-card p-3 sm:p-4"
-                data-simulator-capacity
-              >
-                <div className="flex items-center justify-between gap-3 text-xs">
-                  <span className="font-medium text-foreground">Host capacity</span>
-                  <span className="text-muted-foreground">
-                    {activeCount} / {maxActive} active
-                  </span>
-                </div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden>
-                  <div
-                    className="h-full rounded-full bg-foreground/70 transition-[width] motion-reduce:transition-none"
-                    style={{ width: `${capacityPercent}%` }}
-                  />
-                </div>
-                <div className="mt-2 flex justify-between gap-3 text-[11px] text-muted-foreground">
-                  <span>{queuedCount > 0 ? `${queuedCount} waiting` : "No queued threads"}</span>
-                  <span>
-                    {devices.length} device{devices.length === 1 ? "" : "s"} available
-                  </span>
-                </div>
-              </section>
-
               {state === "idle" ? (
                 <section
-                  className="rounded-lg border border-border/80 bg-card p-3 sm:p-4"
+                  className="rounded-lg border border-border/80 bg-card p-3"
                   data-simulator-idle
                 >
-                  <div className="flex items-start gap-2.5">
-                    <Smartphone
-                      className="mt-0.5 size-4 shrink-0 text-muted-foreground"
-                      aria-hidden
-                    />
-                    <div>
-                      <h3 className="text-sm font-medium text-foreground">Choose a Simulator</h3>
-                      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        Reserving a device starts a private session for this thread. Other threads
-                        wait instead of sharing it.
-                      </p>
-                    </div>
-                  </div>
                   {devices.length > 0 ? (
-                    <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-                      <div className="min-w-0 flex-1">
-                        <label
-                          className="mb-1 block text-[11px] font-medium text-muted-foreground"
-                          htmlFor="simulator-device"
-                        >
-                          Device
-                        </label>
+                    <>
+                      <div className="flex flex-col gap-2 sm:flex-row">
                         <select
                           id="simulator-device"
+                          aria-label="Simulator device"
                           value={selectedUdid}
                           onChange={(event) => {
                             setSelectedUdid(event.target.value);
                             setActionError(null);
                           }}
-                          className="h-8 w-full rounded-md border border-input bg-background px-2.5 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+                          className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
                           disabled={actionPending}
                         >
                           {devices.map((device) => (
                             <option key={device.udid} value={device.udid}>
-                              {device.name} · {device.runtime} · {device.state}
+                              {device.name} · {device.runtime}
                             </option>
                           ))}
                         </select>
+                        <Button
+                          size="sm"
+                          disabled={actionPending || selectedDevice === null}
+                          onClick={() => void handleAcquire()}
+                        >
+                          {actionPending ? "Starting…" : "Start"}
+                        </Button>
                       </div>
-                      <Button
-                        className="mt-auto"
-                        size="sm"
-                        disabled={actionPending || selectedDevice === null}
-                        onClick={() => void handleAcquire()}
-                      >
-                        {actionPending ? "Starting…" : "Start session"}
-                      </Button>
-                    </div>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Start a private device for this thread; other threads wait while it is in
+                        use.
+                      </p>
+                    </>
                   ) : (
-                    <div className="mt-4 rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">
-                      This environment did not return an available iOS Simulator. Refresh after
-                      installing or creating one on the host.
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs text-muted-foreground">
+                        No iOS Simulators are available on this host.
+                      </p>
+                      <Button variant="outline" size="xs" onClick={refreshSimulatorStatus}>
+                        Retry
+                      </Button>
                     </div>
                   )}
                 </section>
@@ -930,39 +885,30 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
 
               {state === "queued" || state === "starting" ? (
                 <section
-                  className="rounded-lg border border-border/80 bg-card p-4"
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/80 bg-card p-3"
                   data-simulator-pending
                 >
-                  <div className="flex items-start gap-2.5">
-                    <LoaderCircle
-                      className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-300"
-                      aria-hidden
-                    />
-                    <div className="min-w-0">
-                      <h3 className="text-sm font-medium text-foreground">
-                        {state === "queued" ? "Waiting for this device" : "Starting Simulator"}
-                      </h3>
-                      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        {state === "queued"
-                          ? `Queue position ${session?.queuePosition ?? "—"}. The session will start automatically when the device is free.`
-                          : "Booting the device and connecting its live screen. This can take a moment after a cold start."}
-                      </p>
-                    </div>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-medium text-foreground">
+                      {state === "queued"
+                        ? "Waiting for Simulator"
+                        : `Starting ${sessionDeviceLabel}…`}
+                    </h3>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {state === "queued"
+                        ? `Queue position ${session?.queuePosition ?? "—"}. This device starts when the current session releases it.`
+                        : "Booting the device and connecting its screen."}
+                    </p>
                   </div>
                   {session ? (
-                    <div className="mt-4 flex items-center justify-between gap-3 border-t border-border/60 pt-3">
-                      <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
-                        {session.udid}
-                      </span>
-                      <Button
-                        variant="outline"
-                        size="xs"
-                        disabled={actionPending}
-                        onClick={() => void handleRelease()}
-                      >
-                        {actionPending ? "Releasing…" : "Release device"}
-                      </Button>
-                    </div>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={actionPending}
+                      onClick={() => void handleRelease()}
+                    >
+                      {actionPending ? "Canceling…" : "Cancel"}
+                    </Button>
                   ) : null}
                 </section>
               ) : null}
@@ -972,40 +918,71 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                   className="overflow-hidden rounded-lg border border-border/80 bg-card"
                   data-simulator-session
                 >
-                  <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2 sm:px-4">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <CircleCheck
-                        className="size-4 shrink-0 text-emerald-600 dark:text-emerald-300"
-                        aria-hidden
-                      />
-                      <div className="min-w-0">
-                        <h3 className="truncate text-sm font-medium text-foreground">
-                          Live Simulator
-                        </h3>
-                        <p className="truncate text-[11px] text-muted-foreground">{session.udid}</p>
-                      </div>
+                  <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2">
+                    <h3 className="min-w-0 truncate text-sm font-medium text-foreground">
+                      {sessionDeviceLabel}
+                    </h3>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <span
+                        className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300"
+                        aria-live="polite"
+                      >
+                        <CircleCheck className="size-3.5" aria-hidden />
+                        Ready
+                      </span>
+                      <Menu>
+                        <MenuTrigger
+                          render={
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              aria-label="Simulator actions"
+                              title="Simulator actions"
+                            />
+                          }
+                        >
+                          <EllipsisIcon aria-hidden className="size-4" />
+                        </MenuTrigger>
+                        <MenuPopup align="end" className="w-52">
+                          <MenuItem
+                            disabled={!streamUrl || actionPending}
+                            onClick={handleReconnectStream}
+                          >
+                            <RefreshCw aria-hidden />
+                            Reconnect stream
+                          </MenuItem>
+                          <MenuItem
+                            disabled={actionPending}
+                            onClick={() => void handleOpenNative()}
+                          >
+                            <ExternalLinkIcon aria-hidden />
+                            Open in Simulator.app
+                          </MenuItem>
+                          <MenuItem onClick={() => setSessionDetailsOpen((open) => !open)}>
+                            <InfoIcon aria-hidden />
+                            {sessionDetailsOpen ? "Hide session details" : "Session details"}
+                          </MenuItem>
+                          <MenuItem onClick={() => copyToClipboard(session.udid)}>
+                            <CopyIcon aria-hidden />
+                            {hasCopiedDeviceId ? "Device ID copied" : "Copy device ID"}
+                          </MenuItem>
+                          <MenuSeparator />
+                          <MenuItem
+                            variant="destructive"
+                            disabled={actionPending}
+                            onClick={() => void handleRelease()}
+                          >
+                            <CircleX aria-hidden />
+                            {actionPending ? "Releasing device…" : "Release device"}
+                          </MenuItem>
+                        </MenuPopup>
+                      </Menu>
                     </div>
-                    <span
-                      className={cn(
-                        "inline-flex shrink-0 items-center gap-1 text-[11px]",
-                        streamState === "live"
-                          ? "text-emerald-700 dark:text-emerald-300"
-                          : "text-muted-foreground",
-                      )}
-                      aria-live="polite"
-                    >
-                      {streamState === "live" ? (
-                        <Wifi className="size-3" aria-hidden />
-                      ) : (
-                        <WifiOff className="size-3" aria-hidden />
-                      )}
-                      {streamLabel(streamState)}
-                    </span>
                   </div>
 
-                  <div className="p-3 sm:p-4">
+                  <div className="p-2 sm:p-3">
                     <div
-                      className="relative mx-auto w-full overflow-hidden rounded-[1rem] border border-border/70 bg-black shadow-inner"
+                      className="relative mx-auto w-full overflow-hidden rounded-xl border border-border/70 bg-black shadow-inner"
                       style={
                         mediaDimensions
                           ? { aspectRatio: `${mediaDimensions.width} / ${mediaDimensions.height}` }
@@ -1033,7 +1010,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                               <LoaderCircle className="size-4" aria-hidden />
                             )}
                             {streamState === "unavailable"
-                              ? "The stream could not reconnect. Refresh status to request a new stream capability."
+                              ? "Stream unavailable"
                               : streamLabel(streamState)}
                           </span>
                         </div>
@@ -1058,66 +1035,48 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                       />
                     </div>
 
-                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-                      <p className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <MousePointer2 className="size-3 shrink-0" aria-hidden />
-                        <span className="truncate">
-                          Click the screen, then type or use the controls.
-                        </span>
-                      </p>
-                      <div className="flex shrink-0 items-center gap-1">
-                        <Button
-                          variant="outline"
-                          size="icon-xs"
-                          aria-label="Rotate Simulator counterclockwise"
-                          title="Rotate counterclockwise"
-                          disabled={!controlsEnabled}
-                          onClick={() => rotate("counterclockwise")}
-                        >
-                          <RotateCcw aria-hidden />
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="icon-xs"
-                          aria-label="Go to Simulator Home screen"
-                          title="Home"
-                          disabled={!controlsEnabled}
-                          onClick={sendHome}
-                        >
-                          <Home aria-hidden />
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="icon-xs"
-                          aria-label="Rotate Simulator clockwise"
-                          title="Rotate clockwise"
-                          disabled={!controlsEnabled}
-                          onClick={() => rotate("clockwise")}
-                        >
-                          <RotateCw aria-hidden />
-                        </Button>
-                      </div>
+                    <div className="mt-2 flex items-center justify-center gap-1 rounded-md bg-muted/50 p-1">
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Rotate Simulator counterclockwise"
+                        title="Rotate counterclockwise"
+                        disabled={!controlsEnabled}
+                        onClick={() => rotate("counterclockwise")}
+                      >
+                        <RotateCcw aria-hidden />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Go to Simulator Home screen"
+                        title="Home"
+                        disabled={!controlsEnabled}
+                        onClick={sendHome}
+                      >
+                        <Home aria-hidden />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Rotate Simulator clockwise"
+                        title="Rotate clockwise"
+                        disabled={!controlsEnabled}
+                        onClick={() => rotate("clockwise")}
+                      >
+                        <RotateCw aria-hidden />
+                      </Button>
                     </div>
-                    <div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                      <Keyboard className="size-3" aria-hidden />
-                      Standard keys, arrows, Return, Delete, and Shift are forwarded while the
-                      screen is focused.
-                    </div>
-                  </div>
 
-                  <dl className="grid gap-1.5 border-t border-border/70 px-3 py-3 sm:px-4">
-                    <DetailRow label="Lease" value={session.leaseId} code />
-                    <DetailRow label="Generation" value={String(session.generation)} code />
-                  </dl>
-                  <div className="border-t border-border/70 px-3 py-2 sm:px-4">
-                    <Button
-                      variant="outline"
-                      size="xs"
-                      disabled={actionPending}
-                      onClick={() => void handleRelease()}
-                    >
-                      {actionPending ? "Releasing…" : "Release device"}
-                    </Button>
+                    <Collapsible open={sessionDetailsOpen} onOpenChange={setSessionDetailsOpen}>
+                      <CollapsiblePanel>
+                        <dl className="mt-2 grid gap-1.5 border-t border-border/70 pt-2">
+                          <DetailRow label="Device ID" value={session.udid} code />
+                          <DetailRow label="Lease" value={session.leaseId} code />
+                          <DetailRow label="Generation" value={String(session.generation)} code />
+                        </dl>
+                      </CollapsiblePanel>
+                    </Collapsible>
                   </div>
                 </section>
               ) : null}
