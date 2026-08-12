@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { Readable } from "node:stream";
 
 import {
@@ -11,11 +12,17 @@ import {
 } from "./XcodeBuildMcpClient.ts";
 
 const simulatorId = "2CD5E4A0-24C3-4F61-B751-8D0A74EE8A0F";
+const appPath =
+  "/worktrees/thread-a/.t3/simulator/DerivedData/Build/Products/Debug-iphonesimulator/App.app";
+const bundleId = "com.example.app";
 
-const success = (data: Record<string, unknown>): XcodeBuildMcpToolResult => ({
+const success = (
+  data: Record<string, unknown>,
+  schema = "xcodebuildmcp.output.test",
+): XcodeBuildMcpToolResult => ({
   content: [{ type: "text", text: "ok" }],
   structuredContent: {
-    schema: "xcodebuildmcp.output.test",
+    schema,
     schemaVersion: "2",
     didError: false,
     error: null,
@@ -48,23 +55,35 @@ class FakeTransport implements XcodeBuildMcpTransport {
 class FakeClient implements XcodeBuildMcpClientLike {
   connectCalls = 0;
   closeCalls = 0;
-  readonly calls: Array<{ readonly name: string; readonly arguments?: Record<string, unknown> }> =
-    [];
+  connectOptions: RequestOptions | undefined;
+  readonly calls: Array<{
+    readonly name: string;
+    readonly arguments?: Record<string, unknown>;
+    readonly options?: RequestOptions;
+  }> = [];
   callToolImpl: (
     name: string,
     args: Record<string, unknown> | undefined,
   ) => Promise<XcodeBuildMcpToolResult> = async () => success({});
 
-  connect(): Promise<void> {
+  connect(
+    _transport: Parameters<XcodeBuildMcpClientLike["connect"]>[0],
+    options?: RequestOptions,
+  ): Promise<void> {
     this.connectCalls += 1;
+    this.connectOptions = options;
     return Promise.resolve();
   }
 
-  callTool(params: {
-    readonly name: string;
-    readonly arguments?: Record<string, unknown>;
-  }): Promise<XcodeBuildMcpToolResult> {
-    this.calls.push(params);
+  callTool(
+    params: {
+      readonly name: string;
+      readonly arguments?: Record<string, unknown>;
+    },
+    _resultSchema?: Parameters<XcodeBuildMcpClientLike["callTool"]>[1],
+    options?: RequestOptions,
+  ): Promise<XcodeBuildMcpToolResult> {
+    this.calls.push({ ...params, ...(options === undefined ? {} : { options }) });
     return this.callToolImpl(params.name, params.arguments);
   }
 
@@ -191,6 +210,161 @@ describe("XcodeBuildMcpClient", () => {
         cwd: "/worktrees/thread-a",
       },
     ]);
+  });
+
+  it("builds, validates, then installs and launches on the exact simulator UDID", async () => {
+    const fakeClient = new FakeClient();
+    fakeClient.callToolImpl = async (name) => {
+      switch (name) {
+        case "build_sim":
+          return success(
+            {
+              summary: { status: "SUCCEEDED", target: "simulator" },
+              artifacts: { buildLogPath: "/tmp/xcodebuild.log" },
+            },
+            "xcodebuildmcp.output.build-result",
+          );
+        case "get_sim_app_path":
+          return success(
+            {
+              summary: { status: "SUCCEEDED", target: "simulator" },
+              artifacts: { appPath },
+            },
+            "xcodebuildmcp.output.app-path",
+          );
+        case "get_app_bundle_id":
+          return success({ artifacts: { appPath, bundleId } }, "xcodebuildmcp.output.bundle-id");
+        case "install_app_sim":
+          return success(
+            {
+              summary: { status: "SUCCEEDED" },
+              artifacts: { simulatorId, appPath },
+            },
+            "xcodebuildmcp.output.install-result",
+          );
+        case "launch_app_sim":
+          return success(
+            {
+              summary: { status: "SUCCEEDED" },
+              artifacts: { simulatorId, bundleId },
+            },
+            "xcodebuildmcp.output.launch-result",
+          );
+        default:
+          throw new Error(`Unexpected tool ${name}`);
+      }
+    };
+    const client = makeClient(fakeClient);
+    const controller = new AbortController();
+
+    const build = await client.build({
+      projectPath: "App.xcodeproj",
+      scheme: "App",
+      configuration: "Debug",
+      derivedDataPath: ".t3/simulator/DerivedData",
+      extraArgs: ["-quiet"],
+      signal: controller.signal,
+    });
+    const resolvedApp = await client.getSimAppPath({
+      projectPath: "App.xcodeproj",
+      scheme: "App",
+      configuration: "Debug",
+      derivedDataPath: ".t3/simulator/DerivedData",
+      signal: controller.signal,
+    });
+    const resolvedBundle = await client.getAppBundleId({ appPath, signal: controller.signal });
+    const installed = await client.install({ appPath, signal: controller.signal });
+    const launched = await client.launch({
+      bundleId,
+      launchArgs: ["-uiTesting"],
+      env: { T3_TEST_MODE: "1" },
+      signal: controller.signal,
+    });
+
+    expect(build.artifacts.buildLogPath).toBe("/tmp/xcodebuild.log");
+    expect(resolvedApp.artifacts.appPath).toBe(appPath);
+    expect(resolvedBundle.artifacts.bundleId).toBe(bundleId);
+    expect(installed.artifacts.simulatorId).toBe(simulatorId);
+    expect(launched.artifacts.bundleId).toBe(bundleId);
+    expect(fakeClient.connectOptions).toMatchObject({ signal: controller.signal });
+    expect(
+      fakeClient.calls.map((call) => ({ name: call.name, arguments: call.arguments })),
+    ).toEqual([
+      {
+        name: "build_sim",
+        arguments: {
+          projectPath: "App.xcodeproj",
+          scheme: "App",
+          configuration: "Debug",
+          derivedDataPath: ".t3/simulator/DerivedData",
+          extraArgs: ["-quiet"],
+          simulatorId,
+        },
+      },
+      {
+        name: "get_sim_app_path",
+        arguments: {
+          projectPath: "App.xcodeproj",
+          scheme: "App",
+          configuration: "Debug",
+          derivedDataPath: ".t3/simulator/DerivedData",
+          platform: "iOS Simulator",
+          simulatorId,
+        },
+      },
+      { name: "get_app_bundle_id", arguments: { appPath } },
+      { name: "install_app_sim", arguments: { simulatorId, appPath } },
+      {
+        name: "launch_app_sim",
+        arguments: {
+          simulatorId,
+          bundleId,
+          launchArgs: ["-uiTesting"],
+          env: { T3_TEST_MODE: "1" },
+        },
+      },
+    ]);
+    for (const call of fakeClient.calls) {
+      expect(call.options).toMatchObject({ signal: controller.signal });
+      expect(call.arguments).not.toHaveProperty("signal");
+    }
+
+    await client.close();
+  });
+
+  it("rejects a pinned-schema mismatch and mismatched validated artifacts", async () => {
+    const fakeClient = new FakeClient();
+    const client = makeClient(fakeClient);
+    fakeClient.callToolImpl = async () =>
+      success(
+        {
+          artifacts: { appPath: "/other/App.app", bundleId },
+        },
+        "xcodebuildmcp.output.bundle-id",
+      );
+
+    const artifactError = await client.getAppBundleId({ appPath }).catch((cause: unknown) => cause);
+    expect(artifactError).toBeInstanceOf(XcodeBuildMcpError);
+    expect((artifactError as XcodeBuildMcpError).code).toBe("artifact-mismatch");
+
+    await client.close();
+
+    const schemaClient = new FakeClient();
+    schemaClient.callToolImpl = async () =>
+      success(
+        {
+          summary: { status: "SUCCEEDED", target: "simulator" },
+          artifacts: { buildLogPath: "/tmp/xcodebuild.log" },
+        },
+        "xcodebuildmcp.output.app-path",
+      );
+    const schemaMismatch = makeClient(schemaClient);
+    const schemaError = await schemaMismatch
+      .build({ projectPath: "App.xcodeproj", scheme: "App" })
+      .catch((cause: unknown) => cause);
+    expect(schemaError).toBeInstanceOf(XcodeBuildMcpError);
+    expect((schemaError as XcodeBuildMcpError).code).toBe("schema-mismatch");
+    await schemaMismatch.close();
   });
 
   it("serializes calls because XcodeBuildMCP session state is process-local", async () => {

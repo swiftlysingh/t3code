@@ -15,7 +15,17 @@ When running inside T3 Code, use its product-native browser MCP to open the stre
 
 Keep serve-sim on its default `127.0.0.1` binding. Do not expose its preview to a LAN or tunnel unless the user explicitly requests that access and the network is trusted; the preview includes a token-gated shell-execution route.
 
+## T3 agent versus manual frontend flow
+
+For an agent build, call `ios_build_run` with the exact UDID. T3 builds and validates the `.app`
+before leasing the device; after the call returns a session, use `ios_session_status` and finish
+with `ios_session_close`. Do not call `ios_session_open` or start a second `serve-sim` process as
+a prerequisite. A user choosing **Start** in the frontend is a separate manual flow.
+
 ## Start one owned stream
+
+For a T3-managed returned session, use its authenticated in-app stream and skip manual `serve-sim`
+startup. The steps below apply only when this agent explicitly owns a standalone stream.
 
 1. Obtain the exact simulator UDID from the iOS build or launch workflow.
 2. Check whether an existing serve-sim stream for that UDID belongs to another task. Reuse it only when explicitly shared; never kill another task's stream.

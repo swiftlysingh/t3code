@@ -17,6 +17,13 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_STDERR_TAIL_BYTES = 32 * 1024;
 
 const XCODE_BUILD_MCP_WORKFLOWS = "simulator,ui-automation,debugging";
+const XCODE_BUILD_MCP_SCHEMA_VERSION = "2";
+const XCODE_BUILD_MCP_BUILD_RESULT_SCHEMA = "xcodebuildmcp.output.build-result";
+const XCODE_BUILD_MCP_APP_PATH_SCHEMA = "xcodebuildmcp.output.app-path";
+const XCODE_BUILD_MCP_BUNDLE_ID_SCHEMA = "xcodebuildmcp.output.bundle-id";
+const XCODE_BUILD_MCP_INSTALL_RESULT_SCHEMA = "xcodebuildmcp.output.install-result";
+const XCODE_BUILD_MCP_LAUNCH_RESULT_SCHEMA = "xcodebuildmcp.output.launch-result";
+const DEFAULT_SIMULATOR_PLATFORM = "iOS Simulator";
 const SIMULATOR_UDID_PATTERN = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i;
 const DEFAULT_TERMINATE_TIMEOUT_MS = 30_000;
 const execFileAsync = promisify(execFile);
@@ -57,9 +64,9 @@ export type XcodeBuildMcpToolResult = {
 };
 
 export interface XcodeBuildMcpClientOptions {
-  /** Exact worktree that owns this simulator lease. */
+  /** Exact worktree that owns this build preparation or simulator lease. */
   readonly cwd: string;
-  /** Exact simulator UDID selected by the lease manager. */
+  /** Exact simulator UDID selected before and retained by the lease manager. */
   readonly simulatorId: string;
   readonly command?: string;
   readonly npxArgs?: ReadonlyArray<string>;
@@ -73,36 +80,71 @@ export interface XcodeBuildMcpClientOptions {
   readonly createClient?: () => XcodeBuildMcpClientLike;
 }
 
-export interface XcodeBuildMcpBuildRunInput {
+/** Request cancellation supported by @modelcontextprotocol/sdk 1.30.0. */
+export interface XcodeBuildMcpRequestOptions {
+  readonly signal?: AbortSignal;
+}
+
+export interface XcodeBuildMcpProjectInput extends XcodeBuildMcpRequestOptions {
   readonly projectPath?: string;
   readonly workspacePath?: string;
   readonly scheme: string;
   readonly configuration?: string;
   readonly derivedDataPath?: string;
-  readonly launchArgs?: ReadonlyArray<string>;
   readonly useLatestOS?: boolean;
+}
+
+/** The exact values accepted by XcodeBuildMCP 2.6.2's get_sim_app_path tool. */
+export type XcodeBuildMcpSimulatorPlatform =
+  | "iOS Simulator"
+  | "watchOS Simulator"
+  | "tvOS Simulator"
+  | "visionOS Simulator";
+
+/** Compile only. This deliberately maps to build_sim, not build_run_sim. */
+export interface XcodeBuildMcpBuildInput extends XcodeBuildMcpProjectInput {
+  readonly extraArgs?: ReadonlyArray<string>;
   readonly preferXcodebuild?: boolean;
 }
 
-export interface XcodeBuildMcpLaunchInput {
+/** Resolve the app built by build_sim without booting, installing, or launching it. */
+export interface XcodeBuildMcpGetSimAppPathInput extends XcodeBuildMcpProjectInput {
+  /** T3's Simulator boundary is iOS-only, so iOS Simulator is the safe default. */
+  readonly platform?: XcodeBuildMcpSimulatorPlatform;
+}
+
+export interface XcodeBuildMcpGetAppBundleIdInput extends XcodeBuildMcpRequestOptions {
+  readonly appPath: string;
+}
+
+export interface XcodeBuildMcpInstallInput extends XcodeBuildMcpRequestOptions {
+  readonly appPath: string;
+}
+
+export interface XcodeBuildMcpBuildRunInput extends XcodeBuildMcpProjectInput {
+  readonly launchArgs?: ReadonlyArray<string>;
+  readonly preferXcodebuild?: boolean;
+}
+
+export interface XcodeBuildMcpLaunchInput extends XcodeBuildMcpRequestOptions {
   readonly bundleId: string;
   readonly launchArgs?: ReadonlyArray<string>;
   readonly env?: Readonly<Record<string, string>>;
 }
 
-export interface XcodeBuildMcpTapInput {
+export interface XcodeBuildMcpTapInput extends XcodeBuildMcpRequestOptions {
   readonly elementRef: string;
   readonly preDelay?: number;
   readonly postDelay?: number;
 }
 
-export interface XcodeBuildMcpTypeTextInput {
+export interface XcodeBuildMcpTypeTextInput extends XcodeBuildMcpRequestOptions {
   readonly elementRef: string;
   readonly text: string;
   readonly replaceExisting?: boolean;
 }
 
-export interface XcodeBuildMcpWaitForUiInput {
+export interface XcodeBuildMcpWaitForUiInput extends XcodeBuildMcpRequestOptions {
   readonly predicate: "exists" | "gone" | "enabled" | "focused" | "textContains" | "settled";
   readonly elementRef?: string;
   readonly identifier?: string;
@@ -115,7 +157,7 @@ export interface XcodeBuildMcpWaitForUiInput {
   readonly settledDurationMs?: number;
 }
 
-export interface XcodeBuildMcpSwipeInput {
+export interface XcodeBuildMcpSwipeInput extends XcodeBuildMcpRequestOptions {
   readonly withinElementRef: string;
   readonly direction: "up" | "down" | "left" | "right";
   readonly duration?: number;
@@ -135,9 +177,12 @@ export interface XcodeBuildMcpEnvelope<T = unknown> {
 
 export interface XcodeBuildMcpParseOptions {
   readonly expectedSimulatorId?: string;
+  readonly expectedSchema?: string;
+  readonly expectedSchemaVersion?: string;
   readonly requireData?: boolean;
   readonly requireSuccessfulSummary?: boolean;
   readonly requiredArtifact?: string;
+  readonly requiredArtifacts?: ReadonlyArray<string>;
 }
 
 export type XcodeBuildMcpErrorCode =
@@ -146,9 +191,50 @@ export type XcodeBuildMcpErrorCode =
   | "transport"
   | "tool-error"
   | "protocol"
+  | "schema-mismatch"
   | "simulator-mismatch"
   | "failed"
-  | "missing-artifact";
+  | "missing-artifact"
+  | "artifact-mismatch";
+
+type XcodeBuildMcpSuccessfulSummary = Readonly<Record<string, unknown>> & {
+  readonly status: "SUCCEEDED";
+};
+
+type XcodeBuildMcpArtifacts = Readonly<Record<string, unknown>>;
+
+export interface XcodeBuildMcpBuildResult extends Record<string, unknown> {
+  readonly summary: XcodeBuildMcpSuccessfulSummary;
+  readonly artifacts: XcodeBuildMcpArtifacts & { readonly buildLogPath: string };
+}
+
+export interface XcodeBuildMcpAppPathResult extends Record<string, unknown> {
+  readonly summary: XcodeBuildMcpSuccessfulSummary;
+  readonly artifacts: XcodeBuildMcpArtifacts & { readonly appPath: string };
+}
+
+export interface XcodeBuildMcpBundleIdResult extends Record<string, unknown> {
+  readonly artifacts: XcodeBuildMcpArtifacts & {
+    readonly appPath: string;
+    readonly bundleId: string;
+  };
+}
+
+export interface XcodeBuildMcpInstallResult extends Record<string, unknown> {
+  readonly summary: XcodeBuildMcpSuccessfulSummary;
+  readonly artifacts: XcodeBuildMcpArtifacts & {
+    readonly appPath: string;
+    readonly simulatorId: string;
+  };
+}
+
+export interface XcodeBuildMcpLaunchResult extends Record<string, unknown> {
+  readonly summary: XcodeBuildMcpSuccessfulSummary;
+  readonly artifacts: XcodeBuildMcpArtifacts & {
+    readonly bundleId: string;
+    readonly simulatorId: string;
+  };
+}
 
 /** A bounded, structured error for the XcodeBuildMCP child and tool boundary. */
 export class XcodeBuildMcpError extends Error {
@@ -220,6 +306,32 @@ const artifactValue = (data: unknown, artifact: string): unknown => {
   return data.artifacts[artifact];
 };
 
+const requireArtifactString = (toolName: string, data: unknown, artifact: string): string => {
+  const value = artifactValue(data, artifact);
+  if (typeof value === "string" && value.length > 0) return value;
+  throw new XcodeBuildMcpError(
+    "missing-artifact",
+    `XcodeBuildMCP tool '${toolName}' did not return a non-empty '${artifact}' artifact.`,
+    { toolName, details: data },
+  );
+};
+
+const requireMatchingArtifactString = (
+  toolName: string,
+  data: unknown,
+  artifact: string,
+  expected: string,
+): void => {
+  const received = requireArtifactString(toolName, data, artifact);
+  if (received !== expected) {
+    throw new XcodeBuildMcpError(
+      "artifact-mismatch",
+      `XcodeBuildMCP tool '${toolName}' returned ${artifact} '${received}', expected '${expected}'.`,
+      { toolName, details: { artifact, expected, received } },
+    );
+  }
+};
+
 /**
  * Normalize the structured and text-compatible result forms emitted by MCP.
  * This function is deliberately exported so protocol handling can be tested
@@ -270,6 +382,28 @@ export function parseXcodeBuildMcpToolResult<T = Record<string, unknown>>(
     );
   }
 
+  if (options.expectedSchema !== undefined && envelope.schema !== options.expectedSchema) {
+    throw new XcodeBuildMcpError(
+      "schema-mismatch",
+      `XcodeBuildMCP tool '${toolName}' returned schema '${envelope.schema ?? "missing"}', expected '${options.expectedSchema}'.`,
+      { toolName, details: { expected: options.expectedSchema, received: envelope.schema } },
+    );
+  }
+
+  if (
+    options.expectedSchemaVersion !== undefined &&
+    envelope.schemaVersion !== options.expectedSchemaVersion
+  ) {
+    throw new XcodeBuildMcpError(
+      "schema-mismatch",
+      `XcodeBuildMCP tool '${toolName}' returned schema version '${envelope.schemaVersion ?? "missing"}', expected '${options.expectedSchemaVersion}'.`,
+      {
+        toolName,
+        details: { expected: options.expectedSchemaVersion, received: envelope.schemaVersion },
+      },
+    );
+  }
+
   if (options.requireData && data === undefined) {
     throw new XcodeBuildMcpError("protocol", `XcodeBuildMCP tool '${toolName}' omitted data.`, {
       toolName,
@@ -303,15 +437,18 @@ export function parseXcodeBuildMcpToolResult<T = Record<string, unknown>>(
     }
   }
 
-  if (
-    options.requiredArtifact !== undefined &&
-    artifactValue(data, options.requiredArtifact) === undefined
-  ) {
-    throw new XcodeBuildMcpError(
-      "missing-artifact",
-      `XcodeBuildMCP tool '${toolName}' did not return artifact '${options.requiredArtifact}'.`,
-      { toolName, details: data },
-    );
+  const requiredArtifacts = [
+    ...(options.requiredArtifact === undefined ? [] : [options.requiredArtifact]),
+    ...(options.requiredArtifacts ?? []),
+  ];
+  for (const artifact of requiredArtifacts) {
+    if (artifactValue(data, artifact) === undefined) {
+      throw new XcodeBuildMcpError(
+        "missing-artifact",
+        `XcodeBuildMCP tool '${toolName}' did not return artifact '${artifact}'.`,
+        { toolName, details: data },
+      );
+    }
   }
 
   return parsed;
@@ -382,12 +519,12 @@ const requireProjectOrWorkspace = (input: {
 };
 
 /**
- * Private, lease-scoped XcodeBuildMCP client.
+ * Private, simulator-scoped XcodeBuildMCP client.
  *
  * The process is lazy (the first operation starts it), lives for the adapter
- * instance, and is closed by the owner when its simulator lease ends. Every
- * operation is serialized because XcodeBuildMCP keeps session defaults and
- * UI snapshots as process-local state.
+ * instance, and is closed by the owner after build preparation or when its
+ * simulator lease ends. Every operation is serialized because XcodeBuildMCP
+ * keeps session defaults and UI snapshots as process-local state.
  */
 export class XcodeBuildMcpClient {
   readonly simulatorId: string;
@@ -427,9 +564,122 @@ export class XcodeBuildMcpClient {
     return this.#closed;
   }
 
-  async connect(): Promise<void> {
+  async connect(options: XcodeBuildMcpRequestOptions = {}): Promise<void> {
     await this.#serialized(async () => {
-      await this.#ensureConnected();
+      await this.#ensureConnected(options);
+    });
+  }
+
+  /**
+   * Compile an app without leasing, booting, installing, or launching a
+   * Simulator. A caller can resolve and validate its artifact before it asks
+   * the manager to spend the single serve-sim slot.
+   */
+  async build(input: XcodeBuildMcpBuildInput): Promise<XcodeBuildMcpBuildResult> {
+    return this.#serialized(async () => {
+      requireProjectOrWorkspace(input);
+      const args: Record<string, unknown> = {
+        scheme: input.scheme,
+        simulatorId: this.simulatorId,
+      };
+      if (input.projectPath !== undefined) args.projectPath = input.projectPath;
+      if (input.workspacePath !== undefined) args.workspacePath = input.workspacePath;
+      if (input.configuration !== undefined) args.configuration = input.configuration;
+      if (input.derivedDataPath !== undefined) args.derivedDataPath = input.derivedDataPath;
+      if (input.extraArgs !== undefined) args.extraArgs = copyArray(input.extraArgs);
+      if (input.useLatestOS !== undefined) args.useLatestOS = input.useLatestOS;
+      if (input.preferXcodebuild !== undefined) args.preferXcodebuild = input.preferXcodebuild;
+      const { data } = await this.#call(
+        "build_sim",
+        args,
+        {
+          expectedSchema: XCODE_BUILD_MCP_BUILD_RESULT_SCHEMA,
+          expectedSchemaVersion: XCODE_BUILD_MCP_SCHEMA_VERSION,
+          requireData: true,
+          requireSuccessfulSummary: true,
+          requiredArtifact: "buildLogPath",
+        },
+        input,
+      );
+      requireArtifactString("build_sim", data, "buildLogPath");
+      return data as XcodeBuildMcpBuildResult;
+    });
+  }
+
+  /** Resolve the build artifact path without touching the Simulator runtime. */
+  async getSimAppPath(input: XcodeBuildMcpGetSimAppPathInput): Promise<XcodeBuildMcpAppPathResult> {
+    return this.#serialized(async () => {
+      requireProjectOrWorkspace(input);
+      const args: Record<string, unknown> = {
+        scheme: input.scheme,
+        platform: input.platform ?? DEFAULT_SIMULATOR_PLATFORM,
+        simulatorId: this.simulatorId,
+      };
+      if (input.projectPath !== undefined) args.projectPath = input.projectPath;
+      if (input.workspacePath !== undefined) args.workspacePath = input.workspacePath;
+      if (input.configuration !== undefined) args.configuration = input.configuration;
+      if (input.derivedDataPath !== undefined) args.derivedDataPath = input.derivedDataPath;
+      if (input.useLatestOS !== undefined) args.useLatestOS = input.useLatestOS;
+      const { data } = await this.#call(
+        "get_sim_app_path",
+        args,
+        {
+          expectedSchema: XCODE_BUILD_MCP_APP_PATH_SCHEMA,
+          expectedSchemaVersion: XCODE_BUILD_MCP_SCHEMA_VERSION,
+          requireData: true,
+          requireSuccessfulSummary: true,
+          requiredArtifact: "appPath",
+        },
+        input,
+      );
+      requireArtifactString("get_sim_app_path", data, "appPath");
+      return data as XcodeBuildMcpAppPathResult;
+    });
+  }
+
+  /** Extract the bundle identifier from the exact app bundle selected above. */
+  async getAppBundleId(
+    input: XcodeBuildMcpGetAppBundleIdInput,
+  ): Promise<XcodeBuildMcpBundleIdResult> {
+    return this.#serialized(async () => {
+      const { data } = await this.#call(
+        "get_app_bundle_id",
+        { appPath: input.appPath },
+        {
+          expectedSchema: XCODE_BUILD_MCP_BUNDLE_ID_SCHEMA,
+          expectedSchemaVersion: XCODE_BUILD_MCP_SCHEMA_VERSION,
+          requireData: true,
+          requiredArtifacts: ["appPath", "bundleId"],
+        },
+        input,
+      );
+      requireMatchingArtifactString("get_app_bundle_id", data, "appPath", input.appPath);
+      requireArtifactString("get_app_bundle_id", data, "bundleId");
+      return data as XcodeBuildMcpBundleIdResult;
+    });
+  }
+
+  /** Install a previously validated app bundle on this client's exact UDID. */
+  async install(input: XcodeBuildMcpInstallInput): Promise<XcodeBuildMcpInstallResult> {
+    return this.#serialized(async () => {
+      const { data } = await this.#call(
+        "install_app_sim",
+        {
+          simulatorId: this.simulatorId,
+          appPath: input.appPath,
+        },
+        {
+          expectedSchema: XCODE_BUILD_MCP_INSTALL_RESULT_SCHEMA,
+          expectedSchemaVersion: XCODE_BUILD_MCP_SCHEMA_VERSION,
+          requireData: true,
+          requireSuccessfulSummary: true,
+          requiredArtifacts: ["simulatorId", "appPath"],
+        },
+        input,
+      );
+      requireMatchingArtifactString("install_app_sim", data, "simulatorId", this.simulatorId);
+      requireMatchingArtifactString("install_app_sim", data, "appPath", input.appPath);
+      return data as XcodeBuildMcpInstallResult;
     });
   }
 
@@ -447,15 +697,20 @@ export class XcodeBuildMcpClient {
       if (input.launchArgs !== undefined) args.launchArgs = copyArray(input.launchArgs);
       if (input.useLatestOS !== undefined) args.useLatestOS = input.useLatestOS;
       if (input.preferXcodebuild !== undefined) args.preferXcodebuild = input.preferXcodebuild;
-      const { data } = await this.#call("build_run_sim", args, {
-        requireSuccessfulSummary: true,
-        requiredArtifact: "appPath",
-      });
+      const { data } = await this.#call(
+        "build_run_sim",
+        args,
+        {
+          requireSuccessfulSummary: true,
+          requiredArtifact: "appPath",
+        },
+        input,
+      );
       return data;
     });
   }
 
-  async launch(input: XcodeBuildMcpLaunchInput): Promise<unknown> {
+  async launch(input: XcodeBuildMcpLaunchInput): Promise<XcodeBuildMcpLaunchResult> {
     return this.#serialized(async () => {
       const args: Record<string, unknown> = {
         simulatorId: this.simulatorId,
@@ -463,17 +718,35 @@ export class XcodeBuildMcpClient {
       };
       if (input.launchArgs !== undefined) args.launchArgs = copyArray(input.launchArgs);
       if (input.env !== undefined) args.env = { ...input.env };
-      const { data } = await this.#call("launch_app_sim", args);
-      return data;
+      const { data } = await this.#call(
+        "launch_app_sim",
+        args,
+        {
+          expectedSchema: XCODE_BUILD_MCP_LAUNCH_RESULT_SCHEMA,
+          expectedSchemaVersion: XCODE_BUILD_MCP_SCHEMA_VERSION,
+          requireData: true,
+          requireSuccessfulSummary: true,
+          requiredArtifacts: ["simulatorId", "bundleId"],
+        },
+        input,
+      );
+      requireMatchingArtifactString("launch_app_sim", data, "simulatorId", this.simulatorId);
+      requireMatchingArtifactString("launch_app_sim", data, "bundleId", input.bundleId);
+      return data as XcodeBuildMcpLaunchResult;
     });
   }
 
-  async stop(bundleId: string): Promise<unknown> {
+  async stop(bundleId: string, options: XcodeBuildMcpRequestOptions = {}): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("stop_app_sim", {
-        simulatorId: this.simulatorId,
-        bundleId,
-      });
+      const { data } = await this.#call(
+        "stop_app_sim",
+        {
+          simulatorId: this.simulatorId,
+          bundleId,
+        },
+        {},
+        options,
+      );
       return data;
     });
   }
@@ -511,61 +784,95 @@ export class XcodeBuildMcpClient {
     }
   }
 
-  async snapshotUi(input: { readonly sinceScreenHash?: string } = {}): Promise<unknown> {
+  async snapshotUi(
+    input: { readonly sinceScreenHash?: string } & XcodeBuildMcpRequestOptions = {},
+  ): Promise<unknown> {
     return this.#serialized(async () => {
       const args: Record<string, unknown> = { simulatorId: this.simulatorId };
       if (input.sinceScreenHash !== undefined) args.sinceScreenHash = input.sinceScreenHash;
-      const { data } = await this.#call("snapshot_ui", args);
+      const { data } = await this.#call("snapshot_ui", args, {}, input);
       return data;
     });
   }
 
-  async screenshot(returnFormat: "path" | "base64" = "path"): Promise<unknown> {
+  async screenshot(
+    returnFormat: "path" | "base64" = "path",
+    options: XcodeBuildMcpRequestOptions = {},
+  ): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("screenshot", {
-        simulatorId: this.simulatorId,
-        returnFormat,
-      });
+      const { data } = await this.#call(
+        "screenshot",
+        {
+          simulatorId: this.simulatorId,
+          returnFormat,
+        },
+        {},
+        options,
+      );
       return data;
     });
   }
 
   async tap(input: XcodeBuildMcpTapInput): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("tap", {
-        simulatorId: this.simulatorId,
-        ...input,
-      });
+      const { signal: _signal, ...tapInput } = input;
+      const { data } = await this.#call(
+        "tap",
+        {
+          simulatorId: this.simulatorId,
+          ...tapInput,
+        },
+        {},
+        input,
+      );
       return data;
     });
   }
 
   async typeText(input: XcodeBuildMcpTypeTextInput): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("type_text", {
-        simulatorId: this.simulatorId,
-        ...input,
-      });
+      const { signal: _signal, ...typeTextInput } = input;
+      const { data } = await this.#call(
+        "type_text",
+        {
+          simulatorId: this.simulatorId,
+          ...typeTextInput,
+        },
+        {},
+        input,
+      );
       return data;
     });
   }
 
   async waitForUi(input: XcodeBuildMcpWaitForUiInput): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("wait_for_ui", {
-        simulatorId: this.simulatorId,
-        ...input,
-      });
+      const { signal: _signal, ...waitForUiInput } = input;
+      const { data } = await this.#call(
+        "wait_for_ui",
+        {
+          simulatorId: this.simulatorId,
+          ...waitForUiInput,
+        },
+        {},
+        input,
+      );
       return data;
     });
   }
 
   async swipe(input: XcodeBuildMcpSwipeInput): Promise<unknown> {
     return this.#serialized(async () => {
-      const { data } = await this.#call("swipe", {
-        simulatorId: this.simulatorId,
-        ...input,
-      });
+      const { signal: _signal, ...swipeInput } = input;
+      const { data } = await this.#call(
+        "swipe",
+        {
+          simulatorId: this.simulatorId,
+          ...swipeInput,
+        },
+        {},
+        input,
+      );
       return data;
     });
   }
@@ -616,7 +923,9 @@ export class XcodeBuildMcpClient {
     return run;
   }
 
-  async #ensureConnected(): Promise<XcodeBuildMcpClientLike> {
+  async #ensureConnected(
+    requestOptions: XcodeBuildMcpRequestOptions = {},
+  ): Promise<XcodeBuildMcpClientLike> {
     if (this.#closed) {
       throw new XcodeBuildMcpError("closed", "XcodeBuildMCP client is closed.");
     }
@@ -671,7 +980,10 @@ export class XcodeBuildMcpClient {
     const client = (this.#options.createClient ?? defaultClient)();
     this.#client = client;
     try {
-      await client.connect(transport, { timeout: this.#connectTimeoutMs });
+      await client.connect(transport, {
+        timeout: this.#connectTimeoutMs,
+        ...(requestOptions.signal === undefined ? {} : { signal: requestOptions.signal }),
+      });
       this.#connected = true;
       return client;
     } catch (error) {
@@ -694,13 +1006,15 @@ export class XcodeBuildMcpClient {
     toolName: string,
     args: Record<string, unknown>,
     options: Omit<XcodeBuildMcpParseOptions, "expectedSimulatorId"> = {},
+    requestOptions: XcodeBuildMcpRequestOptions = {},
   ): Promise<{ readonly envelope: XcodeBuildMcpEnvelope; readonly data: unknown }> {
-    const client = await this.#ensureConnected();
+    const client = await this.#ensureConnected(requestOptions);
     let result: XcodeBuildMcpToolResult;
     try {
       result = await client.callTool({ name: toolName, arguments: args }, undefined, {
         timeout: this.#requestTimeoutMs,
         maxTotalTimeout: this.#requestTimeoutMs,
+        ...(requestOptions.signal === undefined ? {} : { signal: requestOptions.signal }),
       });
     } catch (error) {
       throw new XcodeBuildMcpError(

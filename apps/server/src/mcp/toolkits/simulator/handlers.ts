@@ -6,6 +6,7 @@ import {
   type SimulatorSession,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 
@@ -119,6 +120,26 @@ const withAutomation = (
     return result;
   });
 
+/**
+ * A successful build-and-run intentionally retains its ready session for the
+ * follow-up semantic automation tools. If install or launch fails (including
+ * interruption), only undo a lease created by this invocation. A manually
+ * opened or otherwise reused session stays under its original owner's control.
+ */
+const releaseNewlyAcquiredLease = (
+  manager: Pick<SimulatorManager.SimulatorManager["Service"], "release" | "status">,
+  automation: Pick<SimulatorAutomation.SimulatorAutomation["Service"], "closeSession">,
+  threadId: SimulatorSession["threadId"],
+  acquired: { readonly session: SimulatorSession; readonly acquiredByCall: boolean },
+) =>
+  acquired.acquiredByCall
+    ? releaseSimulatorLeaseAfterAutomationClose(manager, automation, {
+        threadId,
+        leaseId: acquired.session.leaseId,
+        generation: acquired.session.generation,
+      }).pipe(Effect.asVoid)
+    : Effect.void;
+
 const handlers = {
   ios_capabilities: (_input) =>
     Effect.gen(function* () {
@@ -138,12 +159,6 @@ const handlers = {
         sessions: result.sessions.filter((session) => session.threadId === invocation.threadId),
       };
     }),
-  ios_session_open: (input) =>
-    Effect.gen(function* () {
-      const invocation = yield* requireSimulator();
-      const manager = yield* SimulatorManager.SimulatorManager;
-      return yield* manager.acquire({ threadId: invocation.threadId, udid: input.udid });
-    }),
   ios_session_status: (input) =>
     Effect.gen(function* () {
       const invocation = yield* requireSimulator();
@@ -161,12 +176,45 @@ const handlers = {
         generation: input.generation,
       });
     }),
-  ios_build_run: (input) => {
-    const { leaseId, generation, ...operationInput } = input;
-    return withAutomation({ leaseId, generation }, "build-run", (automation, context) =>
-      automation.buildRun(compact({ ...operationInput, ...context })),
-    );
-  },
+  ios_build_run: (input) =>
+    Effect.gen(function* () {
+      const invocation = yield* requireSimulator();
+      const cwd = yield* resolveThreadWorkspace(invocation);
+      const automation = yield* SimulatorAutomation.SimulatorAutomation;
+      const manager = yield* SimulatorManager.SimulatorManager;
+      const { launchArgs, env, ...buildInput } = input;
+
+      // Do the expensive build and .app/bundle validation before occupying
+      // the single shared Simulator slot.
+      const preparedBuild = yield* automation.prepareBuild(compact({ cwd, ...buildInput }));
+
+      return yield* Effect.acquireUseRelease(
+        manager.acquireReady({ threadId: invocation.threadId, udid: input.udid }),
+        (acquired) =>
+          automation
+            .installLaunch(
+              compact({
+                session: acquired.session,
+                cwd,
+                preparedBuild,
+                launchArgs,
+                env,
+              }),
+            )
+            .pipe(
+              Effect.map((results) => ({
+                session: acquired.session,
+                appPath: preparedBuild.appPath,
+                bundleId: preparedBuild.bundleId,
+                results,
+              })),
+            ),
+        (acquired, exit) =>
+          Exit.isSuccess(exit)
+            ? Effect.void
+            : releaseNewlyAcquiredLease(manager, automation, invocation.threadId, acquired),
+      );
+    }),
   ios_launch_app: (input) => {
     const { leaseId, generation, ...operationInput } = input;
     return withAutomation({ leaseId, generation }, "launch-app", (automation, context) =>

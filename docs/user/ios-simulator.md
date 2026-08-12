@@ -21,25 +21,28 @@ agent's first build or UI-automation call.
 The browser or desktop client may be on another operating system. The Mac running the T3 server is
 the machine that runs the Simulator.
 
-## Open a session
+## Open a session manually
 
 1. Open the thread that owns the iOS project.
-2. Ask the agent to use its iOS workflow, or open the Command Palette and choose **Open
-   Simulator** yourself.
+2. Open the Command Palette and choose **Open Simulator** yourself.
 3. Check the host status and device list. T3 shows the device name, runtime, and exact UDID so you
    can tell which Simulator the session uses.
 4. Choose one of the available exact devices.
-5. Choose **Start session** if you are opening it yourself. T3 reserves and boots the device, then
-   discovers the thread's live session when the first real frame is ready. Starting a session does
-   not guess which Xcode project or scheme to build; the agent's build-and-run tool supplies those
-   project details afterward.
+5. Choose **Start** if you are opening it yourself. This manual frontend path reserves and
+   boots the device, then discovers the thread's live session when the first real frame is ready.
+   It does not build an app or guess an Xcode project or scheme.
+
+When an agent is doing the build, leave the frontend session closed. The agent calls `ios_build_run`
+with the exact UDID, and T3 builds and validates the `.app` before leasing the Simulator. The
+returned session is then checked with `ios_session_status` and closed with `ios_session_close` when
+the run ends. **Start** remains available when you want to open a viewer manually.
 
 You do not have to open the Simulator panel before the agent starts. T3 watches the active thread's
-Simulator lease independently of the viewer. If no other right-side surface is active, it opens the
-embedded Simulator automatically when the thread gets a session. If you are looking at Diff, Files,
-Terminal, Agents, or another right-side surface, T3 adds a **Simulator** tab and leaves your
-current surface in place. An activity dot on that tab and the **Watch** control let you follow the
-device as it starts and becomes ready.
+returned Simulator session independently of the viewer. If no other right-side surface is active,
+it opens the embedded Simulator automatically when the thread gets a session. If you are looking at
+Diff, Files, Terminal, Agents, or another right-side surface, T3 adds a **Simulator** tab and leaves
+your current surface in place. An activity dot on that tab and the **Watch** control let you follow
+the device as it starts and becomes ready.
 
 The embedded view is the same thread-scoped session that the agent uses. T3 does not open a second
 browser page or switch to the native Simulator.app just because the agent acquired a lease.
@@ -72,10 +75,12 @@ tab to watch the existing lease manually.
 
 ## What the agent can do
 
-The agent can use T3's iOS tools to acquire the session, build/install/launch the app, inspect the
-accessibility tree through XcodeBuildMCP, tap or type by semantic element, wait for a UI state, and
-take a screenshot. You do not need to copy a UDID between
-the panel and the agent: T3 passes the exact lease device to the scoped build and UI tools.
+The agent starts with T3's `ios_build_run` tool and the exact UDID, so T3 can build and validate the
+`.app` before leasing the Simulator. The same tool then waits for the exact device, installs and
+launches the app, and returns the ready session plus the install and launch results. The agent can
+then check status, inspect the accessibility tree through XcodeBuildMCP, tap or type by semantic
+element, wait for a UI state, and take a screenshot. The panel and the agent follow the same
+returned lease; the agent closes it with `ios_session_close` when finished.
 
 This does not replace Xcode or physical-device testing. Hardware-dependent behavior such as
 camera input, Bluetooth, push delivery, performance under real hardware, signing, and device-only
@@ -120,7 +125,8 @@ connection; the remote client never connects directly to the Mac's Simulator hel
 | Queued                   | Wait for the current owner to release the device, or release your own idle session from the panel.                                                                       |
 | Simulator locked         | Another T3 process owns host capacity. Release that owner, then release/retry this failed session.                                                                       |
 | Starting for a long time | The server may still be booting the device or waiting for its first stream frame. Check the session details; retry after a failure rather than opening a second session. |
-| Build or launch failed   | Read the agent's Xcode diagnostic, fix the project/signing/build issue, and retry or release the failed session.                                                         |
+| Build failed             | Read the Xcode diagnostic and retry after fixing the project. T3 has not leased a Simulator yet.                                                                         |
+| Install or launch failed | Read the Xcode diagnostic and retry. T3 releases a lease created by this run, but preserves an existing manual lease for the thread.                                     |
 | Stream disconnected      | Refresh status to request a new short-lived stream URL. If the sidecar exited, T3 reports a retryable failure.                                                           |
 | Input rejected           | Click the Simulator screen to focus it, reconnect the panel, and make sure the session has not been released or reassigned.                                              |
 

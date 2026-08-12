@@ -91,9 +91,16 @@ const makeReadySession = (thread: ThreadId): SimulatorSession => ({
   updatedAt: "2026-08-09T00:00:00.000Z",
 });
 
-const makeTestRuntime = () => {
+const makeTestRuntime = (
+  options: {
+    readonly initialSession?: SimulatorSession | null;
+    readonly installLaunchFails?: boolean;
+  } = {},
+) => {
   const automationCalls: Array<{ readonly operation: string; readonly input: unknown }> = [];
-  let session: SimulatorSession | null = null;
+  const managerCalls: Array<{ readonly operation: string; readonly input: unknown }> = [];
+  const operationOrder: Array<string> = [];
+  let session: SimulatorSession | null = options.initialSession ?? null;
 
   const simulatorManagerLayer = Layer.mock(SimulatorManager.SimulatorManager)({
     capabilities: Effect.succeed(simulatorCapabilities),
@@ -117,6 +124,23 @@ const makeTestRuntime = () => {
         session ??= makeReadySession(input.threadId);
         return { session };
       }),
+    acquireReady: (input) =>
+      Effect.gen(function* () {
+        managerCalls.push({ operation: "acquireReady", input });
+        operationOrder.push("acquireReady");
+        if (input.udid !== simulatorUdid) {
+          return yield* new SimulatorDeviceNotFoundError({ udid: input.udid });
+        }
+        if (session !== null && session.threadId !== input.threadId) {
+          return yield* new SimulatorLeaseNotFoundError({
+            threadId: input.threadId,
+            leaseId: session.leaseId,
+          });
+        }
+        const acquiredByCall = session === null;
+        session ??= makeReadySession(input.threadId);
+        return { session, acquiredByCall };
+      }),
     status: (input) =>
       Effect.gen(function* () {
         if (
@@ -138,6 +162,7 @@ const makeTestRuntime = () => {
       }),
     release: (input) =>
       Effect.gen(function* () {
+        managerCalls.push({ operation: "release", input });
         if (
           session === null ||
           session.leaseId !== input.leaseId ||
@@ -161,6 +186,31 @@ const makeTestRuntime = () => {
   });
 
   const simulatorAutomationLayer = Layer.mock(SimulatorAutomation.SimulatorAutomation)({
+    prepareBuild: (input) =>
+      Effect.sync(() => {
+        automationCalls.push({ operation: "prepareBuild", input });
+        operationOrder.push("prepareBuild");
+        return {
+          appPath: `${workspaceRoot}/.t3/DerivedData/McpApp.app`,
+          bundleId: "codes.t3.mcp-test",
+          derivedDataPath: `${workspaceRoot}/.t3/DerivedData`,
+        };
+      }),
+    installLaunch: (input) =>
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          automationCalls.push({ operation: "installLaunch", input });
+          operationOrder.push("installLaunch");
+        });
+        if (options.installLaunchFails) {
+          return yield* new SimulatorAutomation.SimulatorAutomationToolError({
+            operation: "install-launch",
+            code: "test-failure",
+            detail: "simulated install failure",
+          });
+        }
+        return { install: { installed: true }, launch: { launched: true } };
+      }),
     tap: (input) =>
       Effect.sync(() => {
         automationCalls.push({ operation: "tap", input });
@@ -189,6 +239,8 @@ const makeTestRuntime = () => {
 
   return {
     automationCalls,
+    managerCalls,
+    operationOrder,
     layer: McpHttpServer.McpToolkitRegistrationLive.pipe(
       // These are read by the test body; retain them while keeping the
       // simulator fakes private to each runtime.
@@ -398,10 +450,7 @@ it.effect("registers annotated tools and preserves authenticated request context
       expect(iosListTool?.tool.annotations?.readOnlyHint).toBe(true);
       expect(iosListTool?.tool.annotations?.idempotentHint).toBe(true);
 
-      const iosOpenTool = server.tools.find(({ tool }) => tool.name === "ios_session_open");
-      expect(iosOpenTool?.tool.annotations?.readOnlyHint).toBe(false);
-      expect(iosOpenTool?.tool.annotations?.idempotentHint).toBe(true);
-      expect(iosOpenTool?.tool.description).toContain("exact iOS Simulator UDID");
+      expect(server.tools.find(({ tool }) => tool.name === "ios_session_open")).toBeUndefined();
 
       const iosStatusTool = server.tools.find(({ tool }) => tool.name === "ios_session_status");
       expect(iosStatusTool?.tool.annotations?.readOnlyHint).toBe(true);
@@ -424,7 +473,6 @@ it.effect("registers annotated tools and preserves authenticated request context
       const iosToolNames = [
         "ios_capabilities",
         "ios_list_simulators",
-        "ios_session_open",
         "ios_session_status",
         "ios_session_close",
         ...iosAutomationTools,
@@ -533,7 +581,7 @@ it.effect("registers annotated tools and preserves authenticated request context
   ).pipe(Effect.provide(runtime.layer));
 });
 
-it.effect("keeps iOS simulator leases scoped to the authenticated invocation thread", () => {
+it.effect("builds before acquiring a thread-scoped ready iOS simulator session", () => {
   const runtime = makeTestRuntime();
   return Effect.scoped(
     Effect.gen(function* () {
@@ -550,24 +598,68 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
             Effect.provideService(McpSchema.McpServerClient, client),
           );
 
-      const opened = yield* call("ios_session_open", { udid: simulatorUdid });
-      expect(opened.isError).toBe(false);
-      const openedContent = opened.structuredContent as { readonly session: SimulatorSession };
-      expect(openedContent.session.state).toBe("ready");
-      expect(openedContent.session.threadId).toBe(invocation.threadId);
-      expect(openedContent.session.udid).toBe(simulatorUdid);
-      expect(openedContent.session.generation).toBe(1);
+      const buildRun = yield* call("ios_build_run", {
+        udid: simulatorUdid,
+        projectPath: "McpApp.xcodeproj",
+        scheme: "McpApp",
+        configuration: "Debug",
+        launchArgs: ["-uiTesting"],
+        env: { MCP_TEST: "1" },
+      });
+      expect(buildRun.isError).toBe(false);
+      const buildRunContent = buildRun.structuredContent as {
+        readonly session: SimulatorSession;
+        readonly appPath: string;
+        readonly bundleId: string;
+        readonly results: { readonly install: unknown; readonly launch: unknown };
+      };
+      expect(buildRunContent).toMatchObject({
+        session: {
+          state: "ready",
+          threadId: invocation.threadId,
+          udid: simulatorUdid,
+          generation: 1,
+        },
+        appPath: `${workspaceRoot}/.t3/DerivedData/McpApp.app`,
+        bundleId: "codes.t3.mcp-test",
+        results: { install: { installed: true }, launch: { launched: true } },
+      });
+      expect(runtime.operationOrder).toEqual(["prepareBuild", "acquireReady", "installLaunch"]);
+
+      const prepareBuildCall = runtime.automationCalls.find(
+        (call) => call.operation === "prepareBuild",
+      );
+      expect(prepareBuildCall?.input).toMatchObject({
+        cwd: workspaceRoot,
+        udid: simulatorUdid,
+        projectPath: "McpApp.xcodeproj",
+        scheme: "McpApp",
+        configuration: "Debug",
+      });
+      const installLaunchCall = runtime.automationCalls.find(
+        (call) => call.operation === "installLaunch",
+      );
+      expect(installLaunchCall?.input).toMatchObject({
+        session: buildRunContent.session,
+        cwd: workspaceRoot,
+        preparedBuild: {
+          appPath: buildRunContent.appPath,
+          bundleId: buildRunContent.bundleId,
+        },
+        launchArgs: ["-uiTesting"],
+        env: { MCP_TEST: "1" },
+      });
 
       const status = yield* call("ios_session_status", {});
       expect(status.isError).toBe(false);
       expect(status.structuredContent).toMatchObject({
         threadId: invocation.threadId,
-        session: { leaseId: openedContent.session.leaseId },
+        session: { leaseId: buildRunContent.session.leaseId },
       });
 
       const crossThreadStatus = yield* call(
         "ios_session_status",
-        { leaseId: openedContent.session.leaseId },
+        { leaseId: buildRunContent.session.leaseId },
         alternateInvocation,
       );
       expect(crossThreadStatus.isError).toBe(true);
@@ -575,40 +667,33 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
       const crossThreadClose = yield* call(
         "ios_session_close",
         {
-          leaseId: openedContent.session.leaseId,
-          generation: openedContent.session.generation,
+          leaseId: buildRunContent.session.leaseId,
+          generation: buildRunContent.session.generation,
         },
         alternateInvocation,
       );
       expect(crossThreadClose.isError).toBe(true);
 
-      const stillOwned = yield* call("ios_session_status", {});
-      expect(stillOwned.isError).toBe(false);
-      expect(stillOwned.structuredContent).toMatchObject({
-        session: { leaseId: openedContent.session.leaseId },
-      });
-
       const staleClose = yield* call("ios_session_close", {
-        leaseId: openedContent.session.leaseId,
-        generation: openedContent.session.generation + 1,
+        leaseId: buildRunContent.session.leaseId,
+        generation: buildRunContent.session.generation + 1,
       });
       expect(staleClose.isError).toBe(true);
 
       const tap = yield* call("ios_tap", {
-        leaseId: openedContent.session.leaseId,
-        generation: openedContent.session.generation,
+        leaseId: buildRunContent.session.leaseId,
+        generation: buildRunContent.session.generation,
         elementRef: "button:continue",
       });
       expect(tap.isError).toBe(false);
       expect(tap.structuredContent).toMatchObject({ tapped: true });
       const tapCall = runtime.automationCalls.find((call) => call.operation === "tap");
-      expect(tapCall).toBeDefined();
       expect(tapCall?.input).toMatchObject({
         session: {
           threadId: invocation.threadId,
-          leaseId: openedContent.session.leaseId,
+          leaseId: buildRunContent.session.leaseId,
           udid: simulatorUdid,
-          generation: openedContent.session.generation,
+          generation: buildRunContent.session.generation,
         },
         cwd: workspaceRoot,
         elementRef: "button:continue",
@@ -618,14 +703,14 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
       expect(tapInput.y).toBeUndefined();
 
       const closed = yield* call("ios_session_close", {
-        leaseId: openedContent.session.leaseId,
-        generation: openedContent.session.generation,
+        leaseId: buildRunContent.session.leaseId,
+        generation: buildRunContent.session.generation,
       });
       expect(closed.isError).toBe(false);
       expect(closed.structuredContent).toMatchObject({
         released: true,
-        leaseId: openedContent.session.leaseId,
-        generation: openedContent.session.generation,
+        leaseId: buildRunContent.session.leaseId,
+        generation: buildRunContent.session.generation,
       });
       const closeCall = runtime.automationCalls.find((call) => call.operation === "closeSession");
       expect(closeCall?.input).toMatchObject({
@@ -634,4 +719,47 @@ it.effect("keeps iOS simulator leases scoped to the authenticated invocation thr
       });
     }),
   ).pipe(Effect.provide(runtime.layer));
+});
+
+it.effect("releases only a newly-created iOS session when install or launch fails", () => {
+  const createdRuntime = makeTestRuntime({ installLaunchFails: true });
+  const manualSession = makeReadySession(threadId);
+  const reusedRuntime = makeTestRuntime({
+    initialSession: manualSession,
+    installLaunchFails: true,
+  });
+
+  const assertFailureCleanup = (
+    runtime: ReturnType<typeof makeTestRuntime>,
+    expectedReleaseCount: number,
+  ) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const call = (name: string, args: Record<string, unknown>) =>
+          server
+            .callTool({ name, arguments: args })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+
+        const buildRun = yield* call("ios_build_run", { udid: simulatorUdid, scheme: "McpApp" });
+        expect(buildRun.isError).toBe(true);
+        expect(runtime.managerCalls.filter((call) => call.operation === "release")).toHaveLength(
+          expectedReleaseCount,
+        );
+
+        const status = yield* call("ios_session_status", {});
+        expect(status.isError).toBe(false);
+        expect(status.structuredContent).toMatchObject({
+          session: expectedReleaseCount === 1 ? null : { leaseId: manualSession.leaseId },
+        });
+      }),
+    ).pipe(Effect.provide(runtime.layer));
+
+  return Effect.gen(function* () {
+    yield* assertFailureCleanup(createdRuntime, 1);
+    yield* assertFailureCleanup(reusedRuntime, 0);
+  });
 });

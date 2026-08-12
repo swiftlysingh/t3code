@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -475,6 +476,180 @@ it.effect("transitions a lease asynchronously from starting to ready", () => {
       },
     });
     expect(status.session?.media?.streamUrl).toMatch(/^\/api\/simulator\//);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("waits for ready and reports whether this call created the thread lease", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const threadId = freshThreadId();
+    const waiting = yield* manager.acquireReady({ threadId, udid: deviceA }).pipe(Effect.forkChild);
+
+    const starting = yield* PubSub.take(events);
+    expect(starting).toMatchObject({
+      type: "session",
+      session: { state: "starting", threadId, udid: deviceA, generation: 1 },
+    });
+    yield* Effect.promise(() => supervisor.waitForStart(deviceA));
+    supervisor.ready(deviceA);
+    yield* PubSub.take(events);
+
+    const created = yield* Fiber.join(waiting);
+    expect(created).toMatchObject({
+      acquiredByCall: true,
+      session: { state: "ready", threadId, udid: deviceA, generation: 1 },
+    });
+    // The ready result is an observation, not a resource scope. The caller
+    // retains the lease and can decide whether a later failure warrants release.
+    expect(hostLock.held.size).toBe(2);
+
+    const reused = yield* manager.acquireReady({ threadId, udid: deviceA });
+    expect(reused).toEqual({ ...created, acquiredByCall: false });
+    expect(supervisor.starts).toEqual([deviceA]);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("follows a queued lease through its next generation until it is ready", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const firstThread = freshThreadId();
+    const secondThread = freshThreadId();
+    const first = yield* manager.acquire({ threadId: firstThread, udid: deviceA });
+    yield* PubSub.take(events);
+
+    const waiting = yield* manager
+      .acquireReady({ threadId: secondThread, udid: deviceB })
+      .pipe(Effect.forkChild);
+    const queued = yield* PubSub.take(events);
+    expect(queued).toMatchObject({
+      type: "session",
+      session: { threadId: secondThread, udid: deviceB, state: "queued", generation: 1 },
+    });
+
+    supervisor.ready(deviceA);
+    yield* PubSub.take(events);
+    yield* manager.release({
+      threadId: firstThread,
+      leaseId: first.session.leaseId,
+      generation: first.session.generation,
+    });
+    yield* PubSub.take(events);
+    const starting = yield* PubSub.take(events);
+    expect(starting).toMatchObject({
+      type: "session",
+      session: { threadId: secondThread, udid: deviceB, state: "starting", generation: 2 },
+    });
+
+    supervisor.ready(deviceB);
+    yield* PubSub.take(events);
+    expect(yield* Fiber.join(waiting)).toMatchObject({
+      acquiredByCall: true,
+      session: { threadId: secondThread, udid: deviceB, state: "ready", generation: 2 },
+    });
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("observes an exact queued lease release without polling", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const first = yield* manager.acquire({ threadId: freshThreadId(), udid: deviceA });
+    yield* PubSub.take(events);
+
+    const threadId = freshThreadId();
+    const waiting = yield* manager.acquireReady({ threadId, udid: deviceB }).pipe(Effect.forkChild);
+    const queued = yield* PubSub.take(events);
+    if (queued.type !== "session") throw new Error("queued session event expected");
+    expect(queued.session).toMatchObject({ threadId, udid: deviceB, state: "queued" });
+
+    yield* manager.release({
+      threadId,
+      leaseId: queued.session.leaseId,
+      generation: queued.session.generation,
+    });
+    expect(yield* PubSub.take(events)).toMatchObject({
+      type: "released",
+      threadId,
+      leaseId: queued.session.leaseId,
+    });
+    const error = yield* Fiber.join(waiting).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(SimulatorLeaseNotFoundError);
+    expect(error).toMatchObject({ threadId, leaseId: queued.session.leaseId });
+
+    // The unrelated first lease remains intact; the helper only waited for its
+    // own exact lease and never performed a broad cleanup.
+    expect((yield* manager.status({ threadId: first.session.threadId })).session).toMatchObject({
+      leaseId: first.session.leaseId,
+      state: "starting",
+    });
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("releases a newly-created lease when its ready wait is interrupted", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const threadId = freshThreadId();
+    const waiting = yield* manager.acquireReady({ threadId, udid: deviceA }).pipe(Effect.forkChild);
+    const starting = yield* PubSub.take(events);
+    if (starting.type !== "session") throw new Error("starting session event expected");
+    yield* Effect.promise(() => supervisor.waitForStart(deviceA));
+
+    yield* Fiber.interrupt(waiting);
+    expect((yield* manager.status({ threadId })).session).toBeNull();
+    expect(hostLock.held.size).toBe(0);
+    expect(supervisor.stopped).toEqual([deviceA]);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("preserves a reused manual lease when its ready wait is interrupted", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock();
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const events = yield* manager.subscribeEvents;
+    const threadId = freshThreadId();
+    const manual = yield* manager.acquire({ threadId, udid: deviceA });
+    yield* PubSub.take(events);
+    yield* Effect.promise(() => supervisor.waitForStart(deviceA));
+
+    const waiting = yield* manager.acquireReady({ threadId, udid: deviceA }).pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    yield* Fiber.interrupt(waiting);
+
+    expect((yield* manager.status({ threadId })).session).toMatchObject({
+      leaseId: manual.session.leaseId,
+      state: "starting",
+    });
+    expect(hostLock.held.size).toBe(2);
+    expect(supervisor.stopped).toEqual([]);
+  }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
+});
+
+it.effect("returns the startup failure delivered for its exact lease", () => {
+  const supervisor = new FakeServeSimSupervisor();
+  const hostLock = makeFakeHostLock(new Set([deviceA]));
+  return Effect.gen(function* () {
+    const manager = yield* SimulatorManager.SimulatorManager;
+    const error = yield* Effect.flip(
+      manager.acquireReady({ threadId: freshThreadId(), udid: deviceA }),
+    );
+
+    expect(error).toBeInstanceOf(SimulatorRuntimeUnavailableError);
+    expect(error).toMatchObject({ operation: "acquire-ready" });
+    expect(supervisor.starts).toEqual([]);
+    expect(hostLock.held.size).toBe(0);
+    expect(hostLock.released).toEqual([capacityLockUdid]);
   }).pipe(Effect.provide(testLayer({ supervisor, hostLock })));
 });
 

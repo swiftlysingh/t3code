@@ -20,7 +20,23 @@ If the tools are missing:
 
 Do not ask contributors to install the OpenAI `build-ios-apps` plugin globally.
 
-## Establish one simulator context
+## Use T3's build-first flow
+
+When the T3 iOS tools are available, use this path and skip direct XcodeBuildMCP session setup:
+
+1. Select one exact UDID from `ios_list_simulators`.
+2. Call `ios_build_run` with that UDID and the project/workspace/scheme. T3 builds and validates
+   the `.app` before leasing the Simulator, then installs and launches it before returning.
+3. Use the returned session's `leaseId` and `generation`; call `ios_session_status` before
+   lease-scoped automation and after reconnects.
+4. Call `ios_session_close` with the returned identifiers when the run is finished.
+
+Do not call `ios_session_open` before `ios_build_run`. A user choosing **Start** in the frontend is
+a separate manual path and does not replace the agent build/run call.
+
+## Establish one direct XcodeBuildMCP context
+
+Use this section only outside T3's lease-aware iOS tools.
 
 1. Call `session_show_defaults` before discovery, build, launch, or UI work.
 2. Call `list_sims` and select one explicit simulator UDID. Prefer a simulator that is already booted; boot an installed simulator when verification requires it, but do not create or download runtimes without user authorization.
@@ -32,6 +48,8 @@ Avoid generic Mac window automation for switching among Simulator windows. Expli
 ## Choose build or launch
 
 - Use `build_run_sim` when native source, native dependencies, entitlements, or project configuration changed.
+- In T3's agent workflow, use `ios_build_run` with the exact UDID instead of opening a session
+  first. Use `build_run_sim` only for a direct XcodeBuildMCP workflow outside T3's lease-aware tools.
 - Use `test_sim` for the smallest relevant native test target or test cases; do not run an entire workspace test matrix routinely.
 - Use `launch_app_sim` when a compatible app is already installed and no native rebuild is needed.
 - To reuse an existing build artifact, use `get_sim_app_path` or `get_app_bundle_id`, install it with `install_app_sim` when necessary, and then launch it.

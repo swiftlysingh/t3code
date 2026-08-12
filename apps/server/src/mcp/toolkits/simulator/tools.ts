@@ -1,11 +1,11 @@
 import {
   EnvironmentId,
   PositiveInt,
-  SimulatorAcquireResult,
   SimulatorCapabilities,
   SimulatorError,
   SimulatorLeaseId,
   SimulatorListResult,
+  SimulatorSession,
   SimulatorStatusResult,
   SimulatorUdid,
   ThreadId,
@@ -44,22 +44,13 @@ export class McpSimulatorWorkspaceUnavailableError extends Schema.TaggedErrorCla
   }
 }
 
-const iosSessionOpenInput = Schema.Struct({
-  udid: SimulatorUdid.annotate({
-    description:
-      "The exact iOS Simulator UDID to lease. Use ios_list_simulators first; do not pass a device name or infer a UDID.",
-  }),
-});
-
-export type IosSessionOpenInput = typeof iosSessionOpenInput.Type;
-
 const leaseInput = {
   leaseId: SimulatorLeaseId.annotate({
-    description: "The exact leaseId returned by ios_session_open.",
+    description: "The exact leaseId returned by ios_build_run or ios_session_status.",
   }),
   generation: PositiveInt.annotate({
     description:
-      "The current lease generation returned by ios_session_open or ios_session_status; stale generations are rejected.",
+      "The current lease generation returned by ios_build_run or ios_session_status; stale generations are rejected.",
   }),
 };
 
@@ -86,7 +77,10 @@ const boundedArgument = TrimmedNonEmptyString.check(Schema.isMaxLength(4_096));
 const boundedText = Schema.String.check(Schema.isMaxLength(32_000));
 
 const iosBuildRunInput = Schema.Struct({
-  ...leaseInput,
+  udid: SimulatorUdid.annotate({
+    description:
+      "The exact iOS Simulator UDID to use after the app bundle has been built and verified. Use ios_list_simulators first; do not pass a device name.",
+  }),
   projectPath: Schema.optional(
     boundedPath.annotate({ description: "Project path relative to the thread workspace." }),
   ),
@@ -99,6 +93,12 @@ const iosBuildRunInput = Schema.Struct({
   configuration: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
   derivedDataPath: Schema.optional(boundedPath),
   launchArgs: Schema.optional(Schema.Array(boundedArgument).check(Schema.isMaxLength(64))),
+  env: Schema.optional(
+    Schema.Record(
+      TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+      Schema.String.check(Schema.isMaxLength(4_096)),
+    ),
+  ),
   useLatestOS: Schema.optional(Schema.Boolean),
   preferXcodebuild: Schema.optional(Schema.Boolean),
 });
@@ -205,6 +205,17 @@ const automationFailure = simulatorFailure;
 // output schema to MCP clients.
 const xcodeBuildMcpResult = Schema.Record(Schema.String, Schema.Unknown);
 
+/** The app is built before a Simulator lease is acquired, then installed and launched once ready. */
+export const IosBuildRunResult = Schema.Struct({
+  session: SimulatorSession,
+  appPath: boundedPath,
+  bundleId: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  results: Schema.Struct({
+    install: xcodeBuildMcpResult,
+    launch: xcodeBuildMcpResult,
+  }),
+});
+
 export const IosCapabilitiesTool = Tool.make("ios_capabilities", {
   description:
     "Report iOS Simulator host support, exact-device enumeration, live streaming, human input, and XcodeBuildMCP agent automation readiness.",
@@ -220,7 +231,7 @@ export const IosCapabilitiesTool = Tool.make("ios_capabilities", {
 
 export const IosListSimulatorsTool = Tool.make("ios_list_simulators", {
   description:
-    "List available iOS Simulators by exact UDID and report authenticated thread sessions. Use the returned UDID with ios_session_open.",
+    "List available iOS Simulators by exact UDID and report authenticated thread sessions. Use a returned UDID with ios_build_run.",
   parameters: Schema.Struct({}),
   success: SimulatorListResult,
   failure: simulatorFailure,
@@ -228,19 +239,6 @@ export const IosListSimulatorsTool = Tool.make("ios_list_simulators", {
 })
   .annotate(Tool.Title, "List iOS Simulators")
   .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true);
-
-export const IosSessionOpenTool = Tool.make("ios_session_open", {
-  description:
-    "Lease one exact iOS Simulator UDID for this authenticated agent thread. The call returns immediately with a queued or starting session; use ios_session_status until it is ready before invoking automation.",
-  parameters: iosSessionOpenInput,
-  success: SimulatorAcquireResult,
-  failure: simulatorFailure,
-  dependencies,
-})
-  .annotate(Tool.Title, "Open iOS Simulator session")
-  .annotate(Tool.OpenWorld, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
@@ -275,9 +273,9 @@ const automationTool = <T extends Tool.Any>(tool: T): T =>
 export const IosBuildRunTool = automationTool(
   Tool.make("ios_build_run", {
     description:
-      "Build and run an iOS project or workspace from this authenticated thread's workspace on the leased exact simulator UDID. The server confines paths to the thread workspace and uses isolated derived data.",
+      "Build and verify an iOS app from this authenticated thread's workspace before acquiring the exact Simulator UDID, then install and launch it. The server confines paths to the thread workspace, uses isolated derived data, and retains a successful session for follow-up automation.",
     parameters: iosBuildRunInput,
-    success: xcodeBuildMcpResult,
+    success: IosBuildRunResult,
     failure: automationFailure,
     dependencies,
   }).annotate(Tool.Title, "Build and run on iOS Simulator"),
@@ -382,7 +380,6 @@ export const IosSwipeTool = automationTool(
 export const IosSimulatorToolkit = Toolkit.make(
   IosCapabilitiesTool,
   IosListSimulatorsTool,
-  IosSessionOpenTool,
   IosSessionStatusTool,
   IosSessionCloseTool,
   IosBuildRunTool,

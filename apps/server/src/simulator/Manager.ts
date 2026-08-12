@@ -31,6 +31,7 @@ import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/ho
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -105,6 +106,18 @@ export interface SimulatorResolvedStream {
   readonly contentType: "multipart/x-mixed-replace; boundary=frame";
 }
 
+/**
+ * A ready lease observed from the same call that requested it. This stays in
+ * the server service rather than the RPC contract: agent orchestration needs
+ * to know whether it may clean up a later install or launch failure, while
+ * the manual acquire RPC intentionally remains fire-and-observe.
+ */
+export interface SimulatorAcquireReadyResult {
+  readonly session: SimulatorSession;
+  /** True only when this call created the thread's lease. */
+  readonly acquiredByCall: boolean;
+}
+
 export class SimulatorManager extends Context.Service<
   SimulatorManager,
   {
@@ -113,6 +126,15 @@ export class SimulatorManager extends Context.Service<
     readonly acquire: (
       input: SimulatorAcquireInput,
     ) => Effect.Effect<SimulatorAcquireResult, SimulatorError>;
+    /**
+     * Subscribe before acquiring, then wait for this exact lease to become
+     * ready. A successful result transfers any newly-created lease to the
+     * caller. Failure or interruption releases only a lease created by this
+     * call; an existing manual/thread lease is never released here.
+     */
+    readonly acquireReady: (
+      input: SimulatorAcquireInput,
+    ) => Effect.Effect<SimulatorAcquireReadyResult, SimulatorError>;
     readonly status: (
       input: SimulatorStatusInput,
     ) => Effect.Effect<SimulatorStatusResult, SimulatorError>;
@@ -178,7 +200,12 @@ type EventDraft =
     };
 
 type AcquireMutation =
-  | { readonly kind: "result"; readonly session: SimulatorSession }
+  | {
+      readonly kind: "result";
+      readonly session: SimulatorSession;
+      /** True only when this mutation inserted a new thread lease. */
+      readonly acquiredByCall: boolean;
+    }
   | { readonly kind: "conflict"; readonly error: SimulatorThreadLeaseConflictError };
 
 type ReleaseMutation =
@@ -841,86 +868,183 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
     },
   );
 
-  const acquire: SimulatorManager["Service"]["acquire"] = Effect.fn("SimulatorManager.acquire")(
-    function* (input) {
-      yield* ensureSupported();
-      const lookup = yield* inventory.find(input.udid).pipe(
-        Effect.mapError((cause): SimulatorError => {
-          if (isInvalidInventoryUdid(cause)) {
-            return new SimulatorDeviceNotFoundError({ udid: input.udid });
-          }
-          return new SimulatorRuntimeUnavailableError({
-            operation: "device-enumeration",
-            cause: errorText(cause),
-          });
-        }),
-      );
-      if (!lookup.supported) {
-        return yield* new SimulatorRuntimeUnavailableError({
+  /**
+   * The normal RPC acquire deliberately returns as soon as it has reserved or
+   * reused a session. Keep the ownership bit here, at the linearized state
+   * mutation, so `acquireReady` never needs a racy before/after status read.
+   */
+  const acquireWithOwnership = Effect.fn("SimulatorManager.acquireWithOwnership")(function* (
+    input: SimulatorAcquireInput,
+  ): Effect.fn.Return<SimulatorAcquireReadyResult, SimulatorError> {
+    yield* ensureSupported();
+    const lookup = yield* inventory.find(input.udid).pipe(
+      Effect.mapError((cause): SimulatorError => {
+        if (isInvalidInventoryUdid(cause)) {
+          return new SimulatorDeviceNotFoundError({ udid: input.udid });
+        }
+        return new SimulatorRuntimeUnavailableError({
           operation: "device-enumeration",
-          cause: "CoreSimulator discovery is unavailable on this host.",
+          cause: errorText(cause),
         });
-      }
-      if (!lookup.device) {
-        return yield* new SimulatorDeviceNotFoundError({ udid: input.udid });
-      }
+      }),
+    );
+    if (!lookup.supported) {
+      return yield* new SimulatorRuntimeUnavailableError({
+        operation: "device-enumeration",
+        cause: "CoreSimulator discovery is unavailable on this host.",
+      });
+    }
+    if (!lookup.device) {
+      return yield* new SimulatorDeviceNotFoundError({ udid: input.udid });
+    }
 
-      const createdAt = yield* nowIso;
-      const mutation = yield* commit(createdAt, (state) => {
-        const existing = findThreadSession(state, input.threadId);
-        if (existing) {
-          if (existing.udid === input.udid) {
-            return {
-              result: { kind: "result", session: existing } as AcquireMutation,
-              state,
-              drafts: [],
-            };
-          }
+    const createdAt = yield* nowIso;
+    const mutation = yield* commit(createdAt, (state) => {
+      const existing = findThreadSession(state, input.threadId);
+      if (existing) {
+        if (existing.udid === input.udid) {
           return {
             result: {
-              kind: "conflict",
-              error: new SimulatorThreadLeaseConflictError({
-                threadId: input.threadId,
-                requestedUdid: input.udid,
-                existingUdid: existing.udid,
-              }),
+              kind: "result",
+              session: existing,
+              acquiredByCall: false,
             } as AcquireMutation,
             state,
             drafts: [],
           };
         }
-
-        const leaseId = makeLeaseId();
-        const shouldQueue =
-          activeSessionCount(state) >= maxActive ||
-          Array.from(state.sessions.values()).some(
-            (candidate) => isActive(candidate) && candidate.udid === input.udid,
-          );
-        const session: SimulatorSession = {
-          leaseId,
-          threadId: input.threadId,
-          udid: input.udid,
-          generation: 1,
-          state: shouldQueue ? "queued" : "starting",
-          ...(shouldQueue ? { queuePosition: state.queue.length + 1 } : {}),
-          createdAt,
-          updatedAt: createdAt,
-        };
-        const sessions = new Map(state.sessions);
-        sessions.set(leaseId, session);
-        const queue = shouldQueue ? [...state.queue, leaseId] : state.queue;
         return {
-          result: { kind: "result", session } as AcquireMutation,
-          state: { ...state, sessions, queue },
-          drafts: [{ type: "session", session }],
+          result: {
+            kind: "conflict",
+            error: new SimulatorThreadLeaseConflictError({
+              threadId: input.threadId,
+              requestedUdid: input.udid,
+              existingUdid: existing.udid,
+            }),
+          } as AcquireMutation,
+          state,
+          drafts: [],
         };
+      }
+
+      const leaseId = makeLeaseId();
+      const shouldQueue =
+        activeSessionCount(state) >= maxActive ||
+        Array.from(state.sessions.values()).some(
+          (candidate) => isActive(candidate) && candidate.udid === input.udid,
+        );
+      const session: SimulatorSession = {
+        leaseId,
+        threadId: input.threadId,
+        udid: input.udid,
+        generation: 1,
+        state: shouldQueue ? "queued" : "starting",
+        ...(shouldQueue ? { queuePosition: state.queue.length + 1 } : {}),
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const sessions = new Map(state.sessions);
+      sessions.set(leaseId, session);
+      const queue = shouldQueue ? [...state.queue, leaseId] : state.queue;
+      return {
+        result: { kind: "result", session, acquiredByCall: true } as AcquireMutation,
+        state: { ...state, sessions, queue },
+        drafts: [{ type: "session", session }],
+      };
+    });
+
+    if (mutation.kind === "conflict") return yield* mutation.error;
+    if (mutation.session.state === "starting") yield* launchActivation(mutation.session);
+    return {
+      session: mutation.session,
+      acquiredByCall: mutation.acquiredByCall,
+    } satisfies SimulatorAcquireReadyResult;
+  });
+
+  const waitForAcquireReady = (
+    subscription: PubSub.Subscription<SimulatorEvent>,
+    acquired: SimulatorAcquireReadyResult,
+  ): Effect.Effect<SimulatorAcquireReadyResult, SimulatorError> => {
+    const unavailable = (session: SimulatorSession): SimulatorRuntimeUnavailableError =>
+      new SimulatorRuntimeUnavailableError({
+        leaseId: session.leaseId,
+        operation: "acquire-ready",
+        cause: session.failure?.message ?? "Simulator session failed before becoming ready.",
       });
 
-      if (mutation.kind === "conflict") return yield* mutation.error;
-      if (mutation.session.state === "starting") yield* launchActivation(mutation.session);
-      return { session: mutation.session } satisfies SimulatorAcquireResult;
+    const released = (session: SimulatorSession): SimulatorLeaseNotFoundError =>
+      new SimulatorLeaseNotFoundError({
+        threadId: session.threadId,
+        leaseId: session.leaseId,
+      });
+
+    const loop = (
+      latest: SimulatorSession,
+    ): Effect.Effect<SimulatorAcquireReadyResult, SimulatorError> => {
+      if (latest.state === "ready") {
+        return Effect.succeed({ session: latest, acquiredByCall: acquired.acquiredByCall });
+      }
+      if (latest.state === "failed") return Effect.fail(unavailable(latest));
+
+      return PubSub.take(subscription).pipe(
+        Effect.flatMap((event) => {
+          if (event.type === "released") {
+            if (
+              event.threadId !== latest.threadId ||
+              event.leaseId !== latest.leaseId ||
+              event.generation < latest.generation
+            ) {
+              return loop(latest);
+            }
+            return Effect.fail(released(latest));
+          }
+
+          const next = event.session;
+          if (
+            next.threadId !== latest.threadId ||
+            next.leaseId !== latest.leaseId ||
+            next.generation < latest.generation
+          ) {
+            return loop(latest);
+          }
+          // A queued lease changes generation when it acquires capacity. Keep
+          // following its lease ID rather than fencing the caller to the
+          // generation returned by the initial acquire.
+          return loop(next);
+        }),
+      );
+    };
+
+    return loop(acquired.session);
+  };
+
+  const acquire: SimulatorManager["Service"]["acquire"] = Effect.fn("SimulatorManager.acquire")(
+    function* (input) {
+      const acquired = yield* acquireWithOwnership(input);
+      return { session: acquired.session } satisfies SimulatorAcquireResult;
     },
   );
+
+  const acquireReady: SimulatorManager["Service"]["acquireReady"] = Effect.fn(
+    "SimulatorManager.acquireReady",
+  )(function* (input) {
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        // Subscribe first. The starting/queued event may be published before
+        // `acquireWithOwnership` returns, and the subscription is also what
+        // makes an immediate startup failure observable without a status poll.
+        const subscription = yield* PubSub.subscribe(eventsPubSub);
+        const acquired = yield* acquireWithOwnership(input);
+        return yield* Effect.interruptible(waitForAcquireReady(subscription, acquired)).pipe(
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit) || !acquired.acquiredByCall
+              ? Effect.void
+              : releaseThread(input.threadId),
+          ),
+        );
+      }),
+    );
+  });
 
   const status: SimulatorManager["Service"]["status"] = Effect.fn("SimulatorManager.status")(
     function* (input) {
@@ -961,6 +1085,10 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
           catch: (cause): SimulatorRuntimeUnavailableError =>
             cleanupFailure(leaseId, "sidecar-close", cause),
         });
+        const runtime = runtimes.get(leaseId);
+        if (runtime?.supervisor === supervisor && runtime.session === null) {
+          runtimes.set(leaseId, { ...runtime, sidecarClosed: true });
+        }
       }
     });
 
@@ -1229,6 +1357,7 @@ export const make = Effect.fn("SimulatorManager.make")(function* (
     capabilities,
     list,
     acquire,
+    acquireReady,
     status,
     open,
     release,

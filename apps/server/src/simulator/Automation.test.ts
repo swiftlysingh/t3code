@@ -34,6 +34,34 @@ const makeSession = (overrides: Partial<SimulatorSession> = {}): SimulatorSessio
 class FakeClient implements SimulatorAutomationClient {
   readonly calls: Array<{ readonly name: string; readonly input?: unknown }> = [];
 
+  async build(input: Parameters<SimulatorAutomationClient["build"]>[0]): Promise<unknown> {
+    this.calls.push({ name: "build", input });
+    return { artifacts: { buildLogPath: "/tmp/build.log" } };
+  }
+
+  async getSimAppPath(
+    input: Parameters<SimulatorAutomationClient["getSimAppPath"]>[0],
+  ): Promise<unknown> {
+    this.calls.push({ name: "getSimAppPath", input });
+    return {
+      artifacts: {
+        appPath: `${input.derivedDataPath}/Build/Products/Debug-iphonesimulator/App.app`,
+      },
+    };
+  }
+
+  async getAppBundleId(
+    input: Parameters<SimulatorAutomationClient["getAppBundleId"]>[0],
+  ): Promise<unknown> {
+    this.calls.push({ name: "getAppBundleId", input });
+    return { artifacts: { appPath: input.appPath, bundleId: "com.example.built" } };
+  }
+
+  async install(input: Parameters<SimulatorAutomationClient["install"]>[0]): Promise<unknown> {
+    this.calls.push({ name: "install", input });
+    return { artifacts: { appPath: input.appPath, simulatorId: udid } };
+  }
+
   async buildRun(input: Parameters<SimulatorAutomationClient["buildRun"]>[0]): Promise<unknown> {
     this.calls.push({ name: "buildRun", input });
     return { artifacts: { bundleId: "com.example.built" } };
@@ -158,6 +186,54 @@ const makeHarness = Effect.gen(function* () {
 });
 
 describe("SimulatorAutomation", () => {
+  it.effect("builds and validates an app before creating a lease-scoped client", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { automation, clients, cwd, options } = yield* makeHarness;
+        const projectPath = path.join(cwd, "App.xcodeproj");
+        const derivedDataPath = path.join(cwd, ".t3", "simulator", "DerivedData");
+        const appPath = path.join(
+          derivedDataPath,
+          "Build",
+          "Products",
+          "Debug-iphonesimulator",
+          "App.app",
+        );
+        yield* fileSystem.makeDirectory(projectPath, { recursive: true });
+        yield* fileSystem.makeDirectory(appPath, { recursive: true });
+        const canonicalAppPath = yield* fileSystem.realPath(appPath);
+        const canonicalDerivedDataPath = yield* fileSystem.realPath(derivedDataPath);
+
+        const prepared = yield* automation.prepareBuild({
+          cwd,
+          udid,
+          projectPath: "App.xcodeproj",
+          scheme: "App",
+        });
+
+        expect(prepared).toEqual({
+          appPath: canonicalAppPath,
+          bundleId: "com.example.built",
+          derivedDataPath: canonicalDerivedDataPath,
+        });
+        expect(options).toEqual([{ cwd, simulatorId: udid }]);
+        expect(clients[0]?.calls.map((call) => call.name)).toEqual([
+          "build",
+          "getSimAppPath",
+          "getAppBundleId",
+          "close",
+        ]);
+        expect(clients[0]?.calls[0]?.input).toMatchObject({
+          projectPath,
+          scheme: "App",
+          derivedDataPath,
+        });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("is lazy, reuses one exact-UDID client per lease, and normalizes build paths", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -176,7 +252,7 @@ describe("SimulatorAutomation", () => {
 
         expect(clients).toHaveLength(1);
         expect(options).toEqual([{ cwd, simulatorId: udid }]);
-        expect(clients[0]?.calls).toEqual([
+        expect(clients[0]?.calls.slice(0, 2)).toMatchObject([
           {
             name: "buildRun",
             input: {

@@ -1,18 +1,19 @@
 /**
- * Lease-scoped, deliberately small adapter over XcodeBuildMCP.
+ * Deliberately small adapter over XcodeBuildMCP.
  *
- * The Simulator manager owns device allocation and the serve-sim process. This
- * service owns the other process boundary: one private XcodeBuildMCP child for
- * one live simulator lease. It never accepts an arbitrary simulator identifier
- * or working directory from an automation operation.
+ * Build preparation uses a short-lived client pinned to the requested UDID but
+ * does not reserve the Simulator. Runtime automation uses one private client
+ * for one live lease. Every path remains confined to the authenticated thread
+ * workspace.
  */
 import { createHash } from "node:crypto";
-import { type SimulatorSession } from "@t3tools/contracts";
+import { type SimulatorSession, type SimulatorUdid } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
@@ -38,6 +39,8 @@ const MAX_ARGUMENT_COUNT = 64;
 const MAX_ARGUMENT_LENGTH = 1_024;
 const MAX_DELAY_MS = 60_000;
 const MAX_WAIT_MS = 5 * 60_000;
+const IOS_SIMULATOR_PLATFORM = "iOS Simulator" as const;
+const SIMULATOR_UDID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 const SimulatorAutomationLeaseErrorReason = Schema.Literals([
   "not-ready",
@@ -149,6 +152,48 @@ export interface SimulatorAutomationBuildRunInput extends SimulatorAutomationLea
   readonly preferXcodebuild?: boolean;
 }
 
+/**
+ * A build prepared before a Simulator lease is acquired. The app path is
+ * canonical, points to an existing `.app` directory, and is contained by the
+ * canonical DerivedData root recorded alongside it.
+ */
+export interface SimulatorAutomationPreparedBuild {
+  readonly appPath: string;
+  readonly bundleId: string;
+  readonly derivedDataPath: string;
+}
+
+/**
+ * Build an app before asking the lease manager to reserve a stream/device.
+ * The caller still supplies one explicit UDID so every XcodeBuildMCP request
+ * remains pinned to the device it will later lease.
+ */
+export interface SimulatorAutomationPrepareBuildInput {
+  /** The exact resolved thread worktree. */
+  readonly cwd: string;
+  /** The exact Simulator that the subsequent lease request will name. */
+  readonly udid: SimulatorUdid;
+  readonly projectPath?: string;
+  readonly workspacePath?: string;
+  readonly scheme: string;
+  readonly configuration?: string;
+  readonly derivedDataPath?: string;
+  readonly useLatestOS?: boolean;
+  readonly preferXcodebuild?: boolean;
+}
+
+/** Install a prepared build and launch it through an already-ready lease. */
+export interface SimulatorAutomationInstallLaunchInput extends SimulatorAutomationLeaseInput {
+  readonly preparedBuild: SimulatorAutomationPreparedBuild;
+  readonly launchArgs?: ReadonlyArray<string>;
+  readonly env?: Readonly<Record<string, string>>;
+}
+
+export interface SimulatorAutomationInstallLaunchResult {
+  readonly install: Readonly<Record<string, unknown>>;
+  readonly launch: Readonly<Record<string, unknown>>;
+}
+
 export interface SimulatorAutomationLaunchInput extends SimulatorAutomationLeaseInput {
   readonly bundleId: string;
   readonly launchArgs?: ReadonlyArray<string>;
@@ -202,14 +247,71 @@ export interface SimulatorAutomationSwipeInput extends SimulatorAutomationLeaseI
   readonly postDelay?: number;
 }
 
+/** Structural pre-lease XcodeBuildMCP inputs, kept local to this boundary. */
+export interface SimulatorAutomationClientBuildInput {
+  readonly projectPath?: string;
+  readonly workspacePath?: string;
+  readonly scheme: string;
+  readonly configuration?: string;
+  readonly derivedDataPath?: string;
+  readonly useLatestOS?: boolean;
+  readonly preferXcodebuild?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface SimulatorAutomationClientGetSimAppPathInput {
+  readonly projectPath?: string;
+  readonly workspacePath?: string;
+  readonly scheme: string;
+  readonly platform: typeof IOS_SIMULATOR_PLATFORM;
+  readonly configuration?: string;
+  readonly derivedDataPath?: string;
+  readonly useLatestOS?: boolean;
+  readonly preferXcodebuild?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface SimulatorAutomationClientGetAppBundleIdInput {
+  readonly appPath: string;
+  readonly signal?: AbortSignal;
+}
+
+export interface SimulatorAutomationClientInstallInput {
+  readonly appPath: string;
+  readonly signal?: AbortSignal;
+}
+
+export interface SimulatorAutomationClientLaunchInput extends XcodeBuildMcpLaunchInput {
+  readonly signal?: AbortSignal;
+}
+
 /** The structural subset used by the service, intentionally easy to fake in tests. */
 export interface SimulatorAutomationClient {
+  /** Build only. This never installs or launches the app. */
+  readonly build: (input: SimulatorAutomationClientBuildInput) => Promise<unknown>;
+  /** Resolve a simulator app path from an already-completed build. */
+  readonly getSimAppPath: (input: SimulatorAutomationClientGetSimAppPathInput) => Promise<unknown>;
+  /** Resolve the bundle identifier embedded in one validated `.app` directory. */
+  readonly getAppBundleId: (
+    input: SimulatorAutomationClientGetAppBundleIdInput,
+  ) => Promise<unknown>;
+  /** Install one validated `.app` directory on this client's exact UDID. */
+  readonly install: (input: SimulatorAutomationClientInstallInput) => Promise<unknown>;
   readonly buildRun: (input: XcodeBuildMcpBuildRunInput) => Promise<unknown>;
-  readonly launch: (input: XcodeBuildMcpLaunchInput) => Promise<unknown>;
-  readonly stop: (bundleId: string) => Promise<unknown>;
+  readonly launch: (input: SimulatorAutomationClientLaunchInput) => Promise<unknown>;
+  readonly stop: (
+    bundleId: string,
+    options?: { readonly signal?: AbortSignal },
+  ) => Promise<unknown>;
   readonly terminate: (bundleId: string) => Promise<void>;
-  readonly snapshotUi: (input?: { readonly sinceScreenHash?: string }) => Promise<unknown>;
-  readonly screenshot: (returnFormat?: "path" | "base64") => Promise<unknown>;
+  readonly snapshotUi: (input?: {
+    readonly sinceScreenHash?: string;
+    readonly signal?: AbortSignal;
+  }) => Promise<unknown>;
+  readonly screenshot: (
+    returnFormat?: "path" | "base64",
+    options?: { readonly signal?: AbortSignal },
+  ) => Promise<unknown>;
   readonly tap: (input: XcodeBuildMcpTapInput) => Promise<unknown>;
   readonly typeText: (input: XcodeBuildMcpTypeTextInput) => Promise<unknown>;
   readonly waitForUi: (input: XcodeBuildMcpWaitForUiInput) => Promise<unknown>;
@@ -234,6 +336,17 @@ export interface SimulatorAutomationOptions {
 export class SimulatorAutomation extends Context.Service<
   SimulatorAutomation,
   {
+    /** Build and validate an app before a Simulator stream lease is acquired. */
+    readonly prepareBuild: (
+      input: SimulatorAutomationPrepareBuildInput,
+    ) => Effect.Effect<
+      SimulatorAutomationPreparedBuild,
+      SimulatorAutomationCwdError | SimulatorAutomationInputError | SimulatorAutomationToolError
+    >;
+    /** Install and launch a prepared app through one existing exact lease. */
+    readonly installLaunch: (
+      input: SimulatorAutomationInstallLaunchInput,
+    ) => Effect.Effect<SimulatorAutomationInstallLaunchResult, SimulatorAutomationError>;
     readonly buildRun: (
       input: SimulatorAutomationBuildRunInput,
     ) => Effect.Effect<unknown, SimulatorAutomationError>;
@@ -309,6 +422,12 @@ interface AutomationState {
   readonly closedThreads: ReadonlySet<string>;
 }
 
+interface BuildLock {
+  readonly previous: Promise<void>;
+  readonly queued: Promise<void>;
+  readonly release: () => void;
+}
+
 const initialState: AutomationState = {
   records: new Map(),
   closedLeases: new Map(),
@@ -333,6 +452,17 @@ const isWithin = (path: Path.Path, root: string, candidate: string): boolean => 
   );
 };
 
+const isNotSymlinkError = (error: PlatformError.PlatformError): boolean => {
+  const cause = error.reason.cause;
+  return (
+    error.reason._tag === "Unknown" &&
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    cause.code === "EINVAL"
+  );
+};
+
 const inputError = (
   operation: string,
   field: string,
@@ -353,6 +483,20 @@ const toolError = (operation: string, cause: unknown): SimulatorAutomationToolEr
     detail: sanitiseDetail(cause instanceof Error ? cause.message : String(cause)),
   });
 };
+
+const requireToolResultRecord = (
+  operation: string,
+  result: unknown,
+): Effect.Effect<Readonly<Record<string, unknown>>, SimulatorAutomationToolError> =>
+  typeof result === "object" && result !== null && !Array.isArray(result)
+    ? Effect.succeed(Object.fromEntries(Object.entries(result)))
+    : Effect.fail(
+        new SimulatorAutomationToolError({
+          operation,
+          code: "invalid-response",
+          detail: "XcodeBuildMCP returned a non-object result.",
+        }),
+      );
 
 const optionalText = (
   operation: string,
@@ -403,6 +547,27 @@ const normaliseThreadCwd = (
     return new SimulatorAutomationCwdError({ cwd, reason: "not-resolved" });
   }
   return cwd;
+};
+
+const normaliseSimulatorUdid = (
+  operation: string,
+  value: unknown,
+): string | SimulatorAutomationInputError => {
+  const udid = requiredText(operation, "udid", value, 36);
+  if (isInputError(udid)) return udid;
+  if (!SIMULATOR_UDID_PATTERN.test(udid)) {
+    return inputError(operation, "udid", "must be a CoreSimulator UDID");
+  }
+  return udid;
+};
+
+const normaliseBoolean = (
+  operation: string,
+  field: string,
+  value: unknown,
+): boolean | undefined | SimulatorAutomationInputError => {
+  if (value === undefined) return undefined;
+  return typeof value === "boolean" ? value : inputError(operation, field, "must be a boolean");
 };
 
 const makeLeaseError = (
@@ -574,6 +739,127 @@ const resolvePathInsideCwd = (
     return resolved;
   });
 
+const ensureNoSymlinkBetween = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  operation: string,
+  field: string,
+  root: string,
+  target: string,
+): Effect.Effect<void, SimulatorAutomationInputError> =>
+  Effect.gen(function* () {
+    const relativePath = path.relative(root, target);
+    if (!isWithin(path, root, target)) {
+      return yield* Effect.fail(inputError(operation, field, "must remain inside DerivedData"));
+    }
+    const parts = relativePath === "" ? [] : relativePath.split(path.sep);
+    let probe = root;
+    for (const part of ["", ...parts]) {
+      if (part !== "") probe = path.join(probe, part);
+      const isLink = yield* fileSystem.readLink(probe).pipe(
+        Effect.as(true),
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            isNotSymlinkError(cause)
+              ? Effect.succeed(false)
+              : Effect.fail(
+                  inputError(operation, field, `could not inspect ${probe} for symbolic links`),
+                ),
+        }),
+      );
+      if (isLink) {
+        return yield* Effect.fail(inputError(operation, field, "must not contain symbolic links"));
+      }
+    }
+  });
+
+const canonicalExistingDirectory = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  operation: string,
+  field: string,
+  value: unknown,
+): Effect.Effect<string, SimulatorAutomationInputError> =>
+  Effect.gen(function* () {
+    const raw = requiredText(operation, field, value, MAX_PATH_LENGTH);
+    if (isInputError(raw)) return yield* Effect.fail(raw);
+    if (!path.isAbsolute(raw) || path.resolve(raw) !== raw || path.normalize(raw) !== raw) {
+      return yield* Effect.fail(inputError(operation, field, "must be an absolute, resolved path"));
+    }
+    const exists = yield* fileSystem
+      .exists(raw)
+      .pipe(Effect.mapError(() => inputError(operation, field, "could not inspect the path")));
+    if (!exists) return yield* Effect.fail(inputError(operation, field, "does not exist"));
+    const canonical = yield* fileSystem
+      .realPath(raw)
+      .pipe(Effect.mapError(() => inputError(operation, field, "could not resolve the path")));
+    const stat = yield* fileSystem
+      .stat(canonical)
+      .pipe(Effect.mapError(() => inputError(operation, field, "could not inspect the path")));
+    if (stat.type !== "Directory") {
+      return yield* Effect.fail(inputError(operation, field, "must name a directory"));
+    }
+    return canonical;
+  });
+
+const validatePreparedAppPath = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  derivedDataPath: string,
+  value: unknown,
+): Effect.Effect<string, SimulatorAutomationInputError> =>
+  Effect.gen(function* () {
+    const appPath = requiredText("prepareBuild", "appPath", value, MAX_PATH_LENGTH);
+    if (isInputError(appPath)) return yield* Effect.fail(appPath);
+    if (
+      !path.isAbsolute(appPath) ||
+      path.resolve(appPath) !== appPath ||
+      path.normalize(appPath) !== appPath
+    ) {
+      return yield* Effect.fail(
+        inputError("prepareBuild", "appPath", "must be an absolute, resolved path"),
+      );
+    }
+    if (path.extname(appPath) !== ".app") {
+      return yield* Effect.fail(
+        inputError("prepareBuild", "appPath", "must name an .app directory"),
+      );
+    }
+    if (!isWithin(path, derivedDataPath, appPath)) {
+      return yield* Effect.fail(
+        inputError("prepareBuild", "appPath", "must remain inside DerivedData"),
+      );
+    }
+    yield* ensureNoSymlinkBetween(
+      fileSystem,
+      path,
+      "prepareBuild",
+      "appPath",
+      derivedDataPath,
+      appPath,
+    );
+    const canonicalDerivedData = yield* canonicalExistingDirectory(
+      fileSystem,
+      path,
+      "prepareBuild",
+      "derivedDataPath",
+      derivedDataPath,
+    );
+    const canonicalAppPath = yield* canonicalExistingDirectory(
+      fileSystem,
+      path,
+      "prepareBuild",
+      "appPath",
+      appPath,
+    );
+    if (!isWithin(path, canonicalDerivedData, canonicalAppPath)) {
+      return yield* Effect.fail(
+        inputError("prepareBuild", "appPath", "resolves outside DerivedData"),
+      );
+    }
+    return canonicalAppPath;
+  });
+
 const normalizeProjectTarget = (
   fileSystem: FileSystem.FileSystem,
   path: Path.Path,
@@ -685,17 +971,20 @@ const normaliseEnv = (
   return output;
 };
 
-const extractBundleId = (result: unknown): string | undefined => {
+const extractArtifactText = (result: unknown, artifact: string): string | undefined => {
   if (typeof result !== "object" || result === null || Array.isArray(result)) return undefined;
-  const direct = "bundleId" in result ? result.bundleId : undefined;
+  const direct = (result as Record<string, unknown>)[artifact];
   if (typeof direct === "string" && direct.length > 0) return direct;
-  const artifacts = "artifacts" in result ? result.artifacts : undefined;
+  const artifacts = (result as Record<string, unknown>).artifacts;
   if (typeof artifacts !== "object" || artifacts === null || Array.isArray(artifacts)) {
     return undefined;
   }
-  const bundleId = "bundleId" in artifacts ? artifacts.bundleId : undefined;
-  return typeof bundleId === "string" && bundleId.length > 0 ? bundleId : undefined;
+  const value = (artifacts as Record<string, unknown>)[artifact];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 };
+
+const extractBundleId = (result: unknown): string | undefined =>
+  extractArtifactText(result, "bundleId");
 
 const derivedDataPathFor = (
   path: Path.Path,
@@ -727,6 +1016,38 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
     const configuredBaseDir = deriveBaseDir(path, options.derivedDataBaseDir);
     const clientFactory = options.createClient ?? defaultClientFactory;
     const state = yield* SynchronizedRef.make<AutomationState>(initialState);
+    const buildLocks = new Map<string, Promise<void>>();
+
+    const acquireBuildLock = (key: string): Effect.Effect<BuildLock> =>
+      Effect.sync(() => {
+        const previous = buildLocks.get(key) ?? Promise.resolve();
+        let release: (() => void) | undefined;
+        const tail = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const queued = previous.then(
+          () => tail,
+          () => tail,
+        );
+        buildLocks.set(key, queued);
+        return { previous, queued, release: () => release?.() };
+      });
+
+    const releaseBuildLock = (key: string, lock: BuildLock): Effect.Effect<void> =>
+      Effect.sync(() => {
+        lock.release();
+        if (buildLocks.get(key) === lock.queued) buildLocks.delete(key);
+      });
+
+    const withBuildLock = <A, E, R>(
+      key: string,
+      use: () => Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> =>
+      Effect.acquireUseRelease(
+        acquireBuildLock(key),
+        (lock) => Effect.promise(() => lock.previous).pipe(Effect.flatMap(use)),
+        (lock) => releaseBuildLock(key, lock),
+      );
 
     const existingRecord = (
       lease: NormalizedLeaseInput,
@@ -857,14 +1178,14 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
     const invoke = <A>(
       operation: string,
       client: ClientRecord,
-      run: () => Promise<A>,
+      run: (signal: AbortSignal) => Promise<A>,
       onSuccess?: (result: A) => void,
     ): Effect.Effect<A, SimulatorAutomationToolError> =>
       Effect.gen(function* () {
         yield* beginOperation(operation, client);
         return yield* Effect.tryPromise({
-          try: async () => {
-            const result = await run();
+          try: async (signal) => {
+            const result = await run(signal);
             onSuccess?.(result);
             return result;
           },
@@ -1023,6 +1344,170 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
             input ?? derivedDataPathFor(path, cwd, configuredBaseDir),
           );
 
+    const invokeTemporary = <A>(
+      operation: string,
+      run: (signal: AbortSignal) => Promise<A>,
+    ): Effect.Effect<A, SimulatorAutomationToolError> =>
+      Effect.tryPromise({
+        try: run,
+        catch: (cause) => toolError(operation, cause),
+      });
+
+    const createTemporaryClient = (
+      cwd: string,
+      udid: string,
+    ): Effect.Effect<SimulatorAutomationClient, SimulatorAutomationToolError> =>
+      Effect.try({
+        try: () => clientFactory({ cwd, simulatorId: udid }),
+        catch: (cause) => toolError("createClient", cause),
+      });
+
+    const closeTemporaryClient = (
+      client: SimulatorAutomationClient,
+    ): Effect.Effect<void, SimulatorAutomationToolError> =>
+      Effect.tryPromise({
+        try: () => client.close(),
+        catch: (cause) => toolError("close", cause),
+      });
+
+    const prepareBuild: SimulatorAutomation["Service"]["prepareBuild"] = (input) =>
+      Effect.gen(function* () {
+        const cwd = normaliseThreadCwd(path, input.cwd);
+        if (isCwdError(cwd)) return yield* Effect.fail(cwd);
+        const udid = normaliseSimulatorUdid("prepareBuild", input.udid);
+        if (isInputError(udid)) return yield* Effect.fail(udid);
+        const target = yield* normalizeProjectTarget(
+          fileSystem,
+          path,
+          "prepareBuild",
+          cwd,
+          input,
+          true,
+        );
+        const scheme = requiredText("prepareBuild", "scheme", input.scheme, MAX_SCHEME_LENGTH);
+        const configuration = optionalText(
+          "prepareBuild",
+          "configuration",
+          input.configuration,
+          MAX_SCHEME_LENGTH,
+        );
+        const useLatestOS = normaliseBoolean("prepareBuild", "useLatestOS", input.useLatestOS);
+        const preferXcodebuild = normaliseBoolean(
+          "prepareBuild",
+          "preferXcodebuild",
+          input.preferXcodebuild,
+        );
+        if (isInputError(scheme)) return yield* Effect.fail(scheme);
+        if (isInputError(configuration)) return yield* Effect.fail(configuration);
+        if (isInputError(useLatestOS)) return yield* Effect.fail(useLatestOS);
+        if (isInputError(preferXcodebuild)) return yield* Effect.fail(preferXcodebuild);
+        const derivedDataPath = yield* resolveDerivedDataPath(
+          "prepareBuild",
+          cwd,
+          input.derivedDataPath,
+        );
+        const canonicalDerivedDataPath = yield* realpathWithNearestExistingParent(
+          fileSystem,
+          path,
+          "prepareBuild",
+          "derivedDataPath",
+          derivedDataPath,
+        );
+
+        return yield* withBuildLock(canonicalDerivedDataPath, () =>
+          Effect.acquireUseRelease(
+            createTemporaryClient(cwd, udid),
+            (client) =>
+              Effect.gen(function* () {
+                const buildInput: SimulatorAutomationClientBuildInput = {
+                  ...target,
+                  scheme,
+                  derivedDataPath,
+                  ...(configuration === undefined ? {} : { configuration }),
+                  ...(useLatestOS === undefined ? {} : { useLatestOS }),
+                  ...(preferXcodebuild === undefined ? {} : { preferXcodebuild }),
+                };
+                yield* invokeTemporary("build", (signal) =>
+                  client.build({ ...buildInput, signal }),
+                );
+                const appPathResult = yield* invokeTemporary("getSimAppPath", (signal) =>
+                  client.getSimAppPath({
+                    ...buildInput,
+                    platform: IOS_SIMULATOR_PLATFORM,
+                    signal,
+                  }),
+                );
+                const appPath = yield* validatePreparedAppPath(
+                  fileSystem,
+                  path,
+                  derivedDataPath,
+                  extractArtifactText(appPathResult, "appPath"),
+                );
+                const bundleIdResult = yield* invokeTemporary("getAppBundleId", (signal) =>
+                  client.getAppBundleId({ appPath, signal }),
+                );
+                const bundleId = requiredText(
+                  "prepareBuild",
+                  "bundleId",
+                  extractBundleId(bundleIdResult),
+                  MAX_BUNDLE_ID_LENGTH,
+                );
+                if (isInputError(bundleId)) return yield* Effect.fail(bundleId);
+                const canonicalDerivedData = yield* canonicalExistingDirectory(
+                  fileSystem,
+                  path,
+                  "prepareBuild",
+                  "derivedDataPath",
+                  derivedDataPath,
+                );
+                return { appPath, bundleId, derivedDataPath: canonicalDerivedData };
+              }),
+            (client) => closeTemporaryClient(client),
+          ),
+        );
+      });
+
+    const installLaunch: SimulatorAutomation["Service"]["installLaunch"] = (input) =>
+      Effect.gen(function* () {
+        const lease = yield* normaliseLease(path, input, true);
+        const launchArgs = normaliseArguments("installLaunch", "launchArgs", input.launchArgs);
+        const env = normaliseEnv("installLaunch", input.env);
+        if (isInputError(launchArgs)) return yield* Effect.fail(launchArgs);
+        if (isInputError(env)) return yield* Effect.fail(env);
+        const appPath = yield* validatePreparedAppPath(
+          fileSystem,
+          path,
+          input.preparedBuild.derivedDataPath,
+          input.preparedBuild.appPath,
+        );
+        const bundleId = requiredText(
+          "installLaunch",
+          "bundleId",
+          input.preparedBuild.bundleId,
+          MAX_BUNDLE_ID_LENGTH,
+        );
+        if (isInputError(bundleId)) return yield* Effect.fail(bundleId);
+        const record = yield* ensureRecord(lease);
+        const install = yield* invoke("install", record, (signal) =>
+          record.client.install({ appPath, signal }),
+        ).pipe(Effect.flatMap((result) => requireToolResultRecord("install", result)));
+        const launch = yield* invoke(
+          "launch",
+          record,
+          (signal) =>
+            record.client.launch({
+              bundleId,
+              ...(launchArgs === undefined ? {} : { launchArgs }),
+              ...(env === undefined ? {} : { env }),
+              signal,
+            }),
+          () => {
+            record.lastBundleId = bundleId;
+          },
+        ).pipe(Effect.flatMap((result) => requireToolResultRecord("launch", result)));
+        return { install, launch };
+      });
+
     const buildRun: SimulatorAutomation["Service"]["buildRun"] = (input) =>
       Effect.gen(function* () {
         const lease = yield* normaliseLease(path, input, true);
@@ -1054,7 +1539,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         const result = yield* invoke(
           "buildRun",
           record,
-          () =>
+          (signal) =>
             record.client.buildRun({
               ...target,
               scheme,
@@ -1065,6 +1550,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
               ...(input.preferXcodebuild === undefined
                 ? {}
                 : { preferXcodebuild: input.preferXcodebuild }),
+              signal,
             }),
           (built) => {
             record.lastBundleId = extractBundleId(built) ?? record.lastBundleId;
@@ -1086,11 +1572,12 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         const result = yield* invoke(
           "launch",
           record,
-          () =>
+          (signal) =>
             record.client.launch({
               bundleId,
               ...(launchArgs === undefined ? {} : { launchArgs }),
               ...(env === undefined ? {} : { env }),
+              signal,
             }),
           () => {
             record.lastBundleId = bundleId;
@@ -1135,7 +1622,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         const result = yield* invoke(
           "stop",
           record,
-          () => record.client.stop(bundleId),
+          (signal) => record.client.stop(bundleId, { signal }),
           () => {
             if (record.lastBundleId === bundleId) record.lastBundleId = undefined;
           },
@@ -1154,8 +1641,11 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         );
         if (isInputError(sinceScreenHash)) return yield* Effect.fail(sinceScreenHash);
         const record = yield* ensureRecord(lease);
-        return yield* invoke("snapshotUi", record, () =>
-          record.client.snapshotUi(sinceScreenHash === undefined ? {} : { sinceScreenHash }),
+        return yield* invoke("snapshotUi", record, (signal) =>
+          record.client.snapshotUi({
+            ...(sinceScreenHash === undefined ? {} : { sinceScreenHash }),
+            signal,
+          }),
         );
       });
 
@@ -1169,7 +1659,9 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
           );
         }
         const record = yield* ensureRecord(lease);
-        return yield* invoke("screenshot", record, () => record.client.screenshot(returnFormat));
+        return yield* invoke("screenshot", record, (signal) =>
+          record.client.screenshot(returnFormat, { signal }),
+        );
       });
 
     const tap: SimulatorAutomation["Service"]["tap"] = (input) =>
@@ -1187,11 +1679,12 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         if (isInputError(preDelay)) return yield* Effect.fail(preDelay);
         if (isInputError(postDelay)) return yield* Effect.fail(postDelay);
         const record = yield* ensureRecord(lease);
-        return yield* invoke("tap", record, () =>
+        return yield* invoke("tap", record, (signal) =>
           record.client.tap({
             elementRef,
             ...(preDelay === undefined ? {} : { preDelay }),
             ...(postDelay === undefined ? {} : { postDelay }),
+            signal,
           }),
         );
       });
@@ -1217,13 +1710,14 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
           return yield* Effect.fail(inputError("typeText", "text", "contains a null byte"));
         }
         const record = yield* ensureRecord(lease);
-        return yield* invoke("typeText", record, () =>
+        return yield* invoke("typeText", record, (signal) =>
           record.client.typeText({
             elementRef,
             text,
             ...(input.replaceExisting === undefined
               ? {}
               : { replaceExisting: input.replaceExisting }),
+            signal,
           }),
         );
       });
@@ -1282,7 +1776,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
         if (isInputError(pollIntervalMs)) return yield* Effect.fail(pollIntervalMs);
         if (isInputError(settledDurationMs)) return yield* Effect.fail(settledDurationMs);
         const record = yield* ensureRecord(lease);
-        return yield* invoke("waitForUi", record, () =>
+        return yield* invoke("waitForUi", record, (signal) =>
           record.client.waitForUi({
             predicate,
             ...(elementRef === undefined ? {} : { elementRef }),
@@ -1294,6 +1788,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
             ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
             ...(settledDurationMs === undefined ? {} : { settledDurationMs }),
+            signal,
           }),
         );
       });
@@ -1335,7 +1830,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
           );
         }
         const record = yield* ensureRecord(lease);
-        return yield* invoke("swipe", record, () =>
+        return yield* invoke("swipe", record, (signal) =>
           record.client.swipe({
             withinElementRef,
             direction: input.direction,
@@ -1343,6 +1838,7 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
             ...(input.distance === undefined ? {} : { distance: input.distance }),
             ...(preDelay === undefined ? {} : { preDelay }),
             ...(postDelay === undefined ? {} : { postDelay }),
+            signal,
           }),
         );
       });
@@ -1383,6 +1879,8 @@ export const makeWithOptions = (options: SimulatorAutomationOptions = {}) =>
     ).pipe(Effect.flatMap(closeRecords), Effect.ignore);
 
     const service = SimulatorAutomation.of({
+      prepareBuild,
+      installLaunch,
       buildRun,
       launch,
       stop,

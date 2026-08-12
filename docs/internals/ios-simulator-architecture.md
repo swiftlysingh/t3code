@@ -6,13 +6,16 @@
 
 ## Product boundary
 
-The Simulator is a machine-local execution resource owned by the T3 server environment. The
-server finds an actual CoreSimulator device, reserves it for a thread, and supervises a
-`serve-sim` process that provides the live view. An agent can then build and launch the thread's
-app through a lease-scoped XcodeBuildMCP session. The web and desktop clients display the same
-device and send typed, authenticated input through T3. The embedded view is the default: acquiring
-a lease does not open or focus the shared native Simulator.app. A user can explicitly open that
-exact device in Simulator.app from the panel when they need the native UI.
+The Simulator is a machine-local execution resource owned by the T3 server environment. A manual
+frontend **Start** action reserves an actual CoreSimulator device and supervises a
+`serve-sim` process that provides the live view. An agent build follows a separate path: it passes
+the exact UDID to `ios_build_run`, and T3 builds and validates the `.app` before leasing the device.
+The tool then waits for the lease, installs and launches the app, and returns the ready session for
+lease-scoped XcodeBuildMCP actions. The web and desktop clients display the same device and send
+typed, authenticated input through T3. The embedded view is the default: acquiring a lease does
+not open or focus the shared native
+Simulator.app. A user can explicitly open that exact device in Simulator.app from the panel when
+they need the native UI.
 
 The client discovers a thread's active lease independently of whether the Simulator viewer is
 mounted. A thread-scoped discovery bridge reconciles session events and status, ensures the
@@ -57,8 +60,8 @@ queued or reported as busy; it is never silently moved to another device.
          +---------------------- loopback only ----------------------+
          |                                                            |
          v                                                            v
- XcodeBuildMCP child (one per lease)                       serve-sim child (one per lease)
-   build / install / launch                                 MJPEG / config / health
+ XcodeBuildMCP build validation + lease child              serve-sim child (one per lease)
+   build, install / launch                                  MJPEG / config / health
    AX snapshot and semantic UI tools                        native input transport
          |                                                            |
          +---------------------------+--------------------------------+
@@ -68,9 +71,9 @@ queued or reported as busy; it is never silently moved to another device.
 ```
 
 The exact Simulator UDID is the identity shared by every layer. A project and thread resolve to a
-worktree. The lease binds that thread and worktree to one UDID, one XcodeBuildMCP child, one
-`serve-sim` child, and one generation. No component is allowed to infer a device from a name after
-the lease has been granted.
+worktree. A returned lease binds that thread and worktree to one UDID, one lease-scoped
+XcodeBuildMCP child, one `serve-sim` child, and one generation. No component is allowed to infer a
+device from a name after the lease has been granted.
 
 | Component          | Responsibility                                                                                                                       |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
@@ -168,10 +171,12 @@ cross-worktree ownership. Both are required. A per-server mutex alone would allo
 to boot, reset, or inject input into the same CoreSimulator device.
 
 The default active lease capacity is one even when several installed devices are available. When
-the capacity is full inside one T3 server, the second request receives a structured `queued` state
-with a queue position. The scheduler wakes on a release event; it does not poll in a tight loop or
-hold the MCP call open. A competing T3 server cannot see that in-memory queue, so the host-wide
-capacity lock instead returns a visible, retryable `simulator-locked` failure.
+the capacity is full inside one T3 server, the second manual request receives a structured
+`queued` state with a queue position. The scheduler wakes on a release event and does not poll in
+a tight loop. The agent-facing `ios_build_run` call remains open while its post-build lease is
+queued or starting so it can return one ready, installed session. A competing T3 server cannot see
+the in-memory queue, so the host-wide capacity lock instead returns a visible, retryable
+`simulator-locked` failure.
 
 One thread has at most one active lease. Repeating an acquire/run request from that thread is
 idempotent and returns the existing lease. Closing the panel is not a release: a user may close a
@@ -197,7 +202,7 @@ ready           The exact device is locked and a real stream frame is available
 failed          A recoverable setup or child operation failed
 ```
 
-Acquisition is an event-driven sequence:
+Manual frontend acquisition is an event-driven sequence:
 
 1. Check host capability and verify the exact requested UDID against current inventory.
 2. Create a generation-fenced starting lease, or return a queued lease when local capacity is full.
@@ -207,8 +212,14 @@ Acquisition is an event-driven sequence:
    `serve-sim`'s automatic `open -ga Simulator` invocation, so this step does not focus
    Simulator.app.
 5. Publish a ready session and a short-lived media capability to the client.
-6. When the agent first invokes a build or semantic action, resolve the authenticated thread's
-   worktree and lazily start its lease-scoped XcodeBuildMCP child.
+6. The user can watch the ready device without building an app. A manual frontend session remains
+   independent of the agent build path.
+
+The agent build path starts before this sequence: `ios_build_run` resolves the authenticated
+thread's worktree, builds and validates the `.app` for the exact UDID, and only then asks the
+manager to lease the device. The returned session supplies the `leaseId` and `generation`; the
+agent checks `ios_session_status` before lease-scoped automation and calls `ios_session_close` when
+finished.
 
 If any step fails, the manager reports the failing stage and preserves enough diagnostics to retry
 or close. It does not silently switch worktrees or UDIDs after the app has started.
@@ -231,21 +242,22 @@ T3 uses XcodeBuildMCP as the agent's first-class build and semantic automation e
 ask an agent to manually configure an unrelated MCP server and does not expose every upstream
 method as an unreviewed pass-through.
 
-The server starts at most one lazy `XcodeBuildMCP@2.6.2` child per Simulator lease using the
-official MCP stdio client. The child is created on the first automation call, scoped to the
-authenticated thread's worktree, and serialized per lease. The `serve-sim` child starts on demand
-when a lease is acquired and is ready to provide the live frame; the XcodeBuildMCP child starts on
-the first build or UI-automation call. Both children are configured for the embedded viewer rather
-than automatically opening Simulator.app. Neither process needs to be managed separately by the
-user, and both are stopped during lease/server cleanup. Calls carry
-the exact project/workspace, scheme, configuration, DerivedData location, bundle identifier, and
-Simulator UDID when those arguments apply. Session defaults are not shared between threads.
+The agent-facing `ios_build_run` operation is the build-first exception to the lease-scoped
+automation path: it carries the exact project/workspace, scheme, configuration, DerivedData
+location, and Simulator UDID, then builds and validates the `.app` before asking the manager for a
+lease. After a session is returned, the server starts at most one lazy `XcodeBuildMCP@2.6.2` child
+per Simulator lease using the official MCP stdio client. That child is scoped to the authenticated
+thread's worktree and serialized per lease for install, launch, and semantic UI work. The
+`serve-sim` child starts on demand for a manual or returned ready lease. Both children are
+configured for the embedded viewer rather than automatically opening Simulator.app. Neither
+process needs to be managed separately by the user, and both are stopped during lease/server
+cleanup. Session defaults are not shared between threads.
 
 The curated T3 agent surface covers the operations needed for the common loop:
 
 - discover capability and devices;
-- acquire/open, inspect status, wait for a queued lease, and close;
-- build, install, and launch the thread's app;
+- build and validate the exact-UDID `.app`, then inspect status and close the returned session;
+- install and launch the thread's app;
 - take an accessibility snapshot and use semantic tap, text, gesture, and wait actions;
 - capture a screenshot.
 
@@ -358,18 +370,19 @@ lease.
 
 Failures are surfaced with a stable category and a next action where possible:
 
-| Failure                                  | T3 behavior                                                                                                                  |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Unsupported host or missing runtime      | Keep T3 usable and report the host requirement; do not attempt to run `simctl`.                                              |
-| Device already owned in this server      | Queue for the exact UDID; never steal or silently migrate.                                                                   |
-| Host capacity owned by another T3 server | Mark setup failed with a retryable lock message; release/retry after the owner is done.                                      |
-| Capacity full                            | Return a bounded `queued` result and wake the request after a release event.                                                 |
-| Build/install/launch failure             | Return the typed XcodeBuildMCP diagnostic while keeping the ready lease available for a corrected retry or explicit release. |
-| Sidecar health or first-frame timeout    | Mark the stream failed, stop the owned child, and allow retry without touching unknown processes.                            |
-| Sidecar exit                             | Mark the lease failed, fence the generation, and release the owned sidecar and locks.                                        |
-| XcodeBuildMCP child/tool failure         | Return a typed automation error; close and recreate the lease-scoped client after release.                                   |
-| Expired media token or stale input       | Reject the request; the client refreshes status/media credentials.                                                           |
-| Thread deletion or T3 server shutdown    | Run owner-scoped cleanup, remove the live viewer state, and release the host lock only after child identity is verified.     |
+| Failure                                  | T3 behavior                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Unsupported host or missing runtime      | Keep T3 usable and report the host requirement; do not attempt to run `simctl`.                                          |
+| Device already owned in this server      | Queue for the exact UDID; never steal or silently migrate.                                                               |
+| Host capacity owned by another T3 server | Mark setup failed with a retryable lock message; release/retry after the owner is done.                                  |
+| Capacity full                            | Return a bounded `queued` result and wake the request after a release event.                                             |
+| Build validation failure                 | Return the typed XcodeBuildMCP diagnostic before leasing; no Simulator capacity is consumed.                             |
+| Install/launch failure                   | Return the typed diagnostic and release a lease created by this call; preserve a pre-existing manual/thread lease.       |
+| Sidecar health or first-frame timeout    | Mark the stream failed, stop the owned child, and allow retry without touching unknown processes.                        |
+| Sidecar exit                             | Mark the lease failed, fence the generation, and release the owned sidecar and locks.                                    |
+| XcodeBuildMCP child/tool failure         | Return a typed automation error; close and recreate the lease-scoped client after release.                               |
+| Expired media token or stale input       | Reject the request; the client refreshes status/media credentials.                                                       |
+| Thread deletion or T3 server shutdown    | Run owner-scoped cleanup, remove the live viewer state, and release the host lock only after child identity is verified. |
 
 Recovery must be explicit and repeatable. A client can reconnect to a live lease and refresh its
 signed media URL; reconnecting does not create a second lease. A failed setup is released before a
@@ -409,10 +422,10 @@ Focused automated coverage is split across the independently failing boundaries:
   Simulator right-panel state, including non-disruptive tab insertion and idempotent discovery.
 
 The supported-host acceptance pass was completed on Apple Silicon macOS with real `simctl`, the
-pinned `serve-sim`, and a private pinned XcodeBuildMCP child. It acquired an exact device,
-received a real first frame through the T3 signed stream route, forwarded a validated panel action,
-built and launched an app from the owning worktree, captured a semantic runtime snapshot and
-screenshot, and explicitly released the lease. Captured visual evidence is available in
+pinned `serve-sim`, and a private pinned XcodeBuildMCP child. It built and validated an app from the
+owning worktree, acquired the exact device, received a real first frame through the T3 signed
+stream route, forwarded a validated panel action, launched the app, captured a semantic runtime
+snapshot and screenshot, and explicitly released the lease. Captured visual evidence is available in
 [`simulator-panel-ready.png`](../assets/ios-simulator/simulator-panel-ready.png) and
 [`simulator-panel-live.mp4`](../assets/ios-simulator/simulator-panel-live.mp4). Platform fallback
 outside Apple Silicon macOS remains expressed through the capability and inventory unit
