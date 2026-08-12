@@ -87,6 +87,9 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
+import * as SimulatorManager from "./simulator/Manager.ts";
+import * as SimulatorAutomation from "./simulator/Automation.ts";
+import { releaseSimulatorLeaseAfterAutomationClose } from "./simulator/Release.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -107,6 +110,7 @@ import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import * as SourceControlDiscovery from "./sourceControl/SourceControlDiscovery.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as AzureDevOpsCli from "./sourceControl/AzureDevOpsCli.ts";
@@ -366,6 +370,8 @@ const makeWsRpcLayer = (
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
       const terminalManager = yield* TerminalManager.TerminalManager;
       const previewManager = yield* PreviewManager.PreviewManager;
+      const simulatorManager = yield* SimulatorManager.SimulatorManager;
+      const simulatorAutomation = yield* SimulatorAutomation.SimulatorAutomation;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -408,6 +414,7 @@ const makeWsRpcLayer = (
       );
       const sourceControlRepositories =
         yield* SourceControlRepositoryService.SourceControlRepositoryService;
+      const pullRequests = yield* PullRequestService.PullRequestService;
       const bootstrapCredentials = yield* PairingGrantStore.PairingGrantStore;
       const sessions = yield* SessionStore.SessionStore;
       const processDiagnostics = yield* ProcessDiagnostics.ProcessDiagnostics;
@@ -1036,53 +1043,83 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
               const normalizedCommand = yield* normalizeDispatchCommand(command);
-              const shouldStopSessionAfterArchive =
-                normalizedCommand.type === "thread.archive"
-                  ? yield* projectionSnapshotQuery
-                      .getThreadShellById(normalizedCommand.threadId)
-                      .pipe(
-                        Effect.map(
-                          Option.match({
-                            onNone: () => false,
-                            onSome: (thread) =>
-                              thread.session !== null && thread.session.status !== "stopped",
-                          }),
-                        ),
-                        Effect.orElseSucceed(() => false),
-                      )
-                  : false;
+              // Archive and settle both mean "done with this thread", so a
+              // live provider session must not keep running background work
+              // (PR monitors, dev servers, subagent fleets) after either
+              // lands. The decider rejects settling a starting/running
+              // session, so for settle this only ever stops an idle one; a
+              // stopped session-set does not count as activity, so the stop
+              // cannot un-settle the thread it follows.
+              const parkingCommand =
+                normalizedCommand.type === "thread.archive" ||
+                normalizedCommand.type === "thread.settle"
+                  ? normalizedCommand
+                  : undefined;
+              // Best-effort on purpose: the user's archive/settle must not
+              // fail because this cleanup read blipped, so a failed read
+              // logs and skips the stop instead of propagating.
+              const shouldStopSessionAfterCommand = parkingCommand
+                ? yield* projectionSnapshotQuery.getThreadShellById(parkingCommand.threadId).pipe(
+                    Effect.map(
+                      Option.match({
+                        onNone: () => false,
+                        onSome: (thread) =>
+                          thread.session !== null && thread.session.status !== "stopped",
+                      }),
+                    ),
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning(
+                        "failed to read thread session state before session-stop check",
+                        { threadId: parkingCommand.threadId, cause },
+                      ).pipe(Effect.as(false)),
+                    ),
+                  )
+                : false;
               const result = yield* dispatchNormalizedCommand(normalizedCommand);
-              if (normalizedCommand.type === "thread.archive") {
-                if (shouldStopSessionAfterArchive) {
+              if (parkingCommand) {
+                const parkingKind = parkingCommand.type === "thread.archive" ? "archive" : "settle";
+                if (shouldStopSessionAfterCommand) {
                   yield* Effect.gen(function* () {
                     const stopCommand = yield* normalizeDispatchCommand({
                       type: "thread.session.stop",
                       commandId: CommandId.make(
-                        `session-stop-for-archive:${normalizedCommand.commandId}`,
+                        `session-stop-for-${parkingKind}:${parkingCommand.commandId}`,
                       ),
-                      threadId: normalizedCommand.threadId,
+                      threadId: parkingCommand.threadId,
                       createdAt: yield* nowIso,
+                      // A settled thread can be re-engaged before this stop is
+                      // decided; the decider then drops the stop instead of
+                      // killing the new session. Archive stops stay
+                      // unconditional: turn starts on archived threads are
+                      // rejected, so there is no new session to protect.
+                      ...(parkingKind === "settle" ? { onlyIfSettled: true } : {}),
                     });
 
                     yield* dispatchNormalizedCommand(stopCommand);
                   }).pipe(
                     Effect.catchCause((cause) =>
-                      Effect.logWarning("failed to stop provider session during archive", {
-                        threadId: normalizedCommand.threadId,
+                      Effect.logWarning(`failed to stop provider session during ${parkingKind}`, {
+                        threadId: parkingCommand.threadId,
                         cause,
                       }),
                     ),
                   );
                 }
 
-                yield* terminalManager.close({ threadId: normalizedCommand.threadId }).pipe(
-                  Effect.catch((error) =>
-                    Effect.logWarning("failed to close thread terminals after archive", {
-                      threadId: normalizedCommand.threadId,
-                      error: error.message,
-                    }),
-                  ),
-                );
+                // Terminals are user-opened panes, not thread background
+                // work: archive removes the thread from view so they close
+                // with it, but a settled thread stays reachable and may be
+                // un-settled, so its terminals stay up.
+                if (parkingCommand.type === "thread.archive") {
+                  yield* terminalManager.close({ threadId: parkingCommand.threadId }).pipe(
+                    Effect.catch((error) =>
+                      Effect.logWarning("failed to close thread terminals after archive", {
+                        threadId: parkingCommand.threadId,
+                        error: error.message,
+                      }),
+                    ),
+                  );
+                }
               }
               return result;
             }).pipe(
@@ -1604,6 +1641,68 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "cloud" },
           ),
+        [WS_METHODS.pullRequestsList]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsList, pullRequests.list(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsListStats]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsListStats, pullRequests.listStats(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsDetail]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsDetail, pullRequests.detail(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsActivity]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsActivity, pullRequests.activity(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsDiffFileContents]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pullRequestsDiffFileContents,
+            pullRequests.diffFileContents(input),
+            { "rpc.aggregate": "pull-requests" },
+          ),
+        [WS_METHODS.pullRequestsRunAction]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsRunAction, pullRequests.runAction(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsComment]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsComment, pullRequests.comment(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsSubmitReview]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsSubmitReview, pullRequests.submitReview(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsReplyToThread]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pullRequestsReplyToThread,
+            pullRequests.replyToThread(input),
+            { "rpc.aggregate": "pull-requests" },
+          ),
+        [WS_METHODS.pullRequestsSetThreadResolution]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pullRequestsSetThreadResolution,
+            pullRequests.setThreadResolution(input),
+            { "rpc.aggregate": "pull-requests" },
+          ),
+        [WS_METHODS.pullRequestsInvalidate]: (input) =>
+          observeRpcEffect(WS_METHODS.pullRequestsInvalidate, pullRequests.invalidate(input), {
+            "rpc.aggregate": "pull-requests",
+          }),
+        [WS_METHODS.pullRequestsReviewerCandidates]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pullRequestsReviewerCandidates,
+            pullRequests.reviewerCandidates(input),
+            { "rpc.aggregate": "pull-requests" },
+          ),
+        [WS_METHODS.pullRequestsRequestReviewers]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pullRequestsRequestReviewers,
+            pullRequests.requestReviewers(input),
+            { "rpc.aggregate": "pull-requests" },
+          ),
         [WS_METHODS.sourceControlLookupRepository]: (input) =>
           observeRpcEffect(
             WS_METHODS.sourceControlLookupRepository,
@@ -1733,8 +1832,32 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
             Effect.gen(function* () {
-              if (input.resource._tag !== "workspace-file") {
+              if (input.resource._tag === "attachment") {
                 return yield* issueAssetUrl({ resource: input.resource });
+              }
+              if (input.resource._tag === "project-favicon") {
+                const project = yield* projectionSnapshotQuery
+                  .getActiveProjectByWorkspaceRoot(input.resource.cwd)
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new AssetWorkspaceContextResolutionError({
+                          resource: input.resource,
+                          cause,
+                        }),
+                    ),
+                  );
+                if (Option.isNone(project)) {
+                  return yield* new AssetWorkspaceContextNotFoundError({
+                    resource: input.resource,
+                  });
+                }
+                return yield* issueAssetUrl({
+                  resource: input.resource,
+                  ...(project.value.faviconPath
+                    ? { projectFaviconPath: project.value.faviconPath }
+                    : {}),
+                });
               }
               const thread = yield* projectionSnapshotQuery
                 .getThreadShellById(input.resource.threadId)
@@ -1993,6 +2116,36 @@ const makeWsRpcLayer = (
             previewAutomationBroker.focusHost(input),
             { "rpc.aggregate": "preview-automation" },
           ),
+        [WS_METHODS.simulatorCapabilities]: (_input) =>
+          observeRpcEffect(WS_METHODS.simulatorCapabilities, simulatorManager.capabilities, {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorList]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorList, simulatorManager.list(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorAcquire]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorAcquire, simulatorManager.acquire(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorStatus]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorStatus, simulatorManager.status(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorOpen]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorOpen, simulatorManager.open(input), {
+            "rpc.aggregate": "simulator",
+          }),
+        [WS_METHODS.simulatorRelease]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.simulatorRelease,
+            releaseSimulatorLeaseAfterAutomationClose(simulatorManager, simulatorAutomation, input),
+            { "rpc.aggregate": "simulator" },
+          ),
+        [WS_METHODS.simulatorSendInput]: (input) =>
+          observeRpcEffect(WS_METHODS.simulatorSendInput, simulatorManager.sendInput(input), {
+            "rpc.aggregate": "simulator",
+          }),
         [WS_METHODS.subscribePreviewEvents]: (_input) =>
           observeRpcStream(WS_METHODS.subscribePreviewEvents, previewManager.events, {
             "rpc.aggregate": "preview",
@@ -2137,6 +2290,10 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.subscribeSimulatorEvents]: (_input) =>
+          observeRpcStream(WS_METHODS.subscribeSimulatorEvents, simulatorManager.events, {
+            "rpc.aggregate": "simulator",
+          }),
       });
     }),
   );
@@ -2145,6 +2302,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
+    const pullRequests = yield* PullRequestService.PullRequestService;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -2168,6 +2326,9 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
+              // One server-lifetime service means clients share the same PR caches, and a WS
+              // mutation invalidates the HTTP diff cache that every client reads from.
+              Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

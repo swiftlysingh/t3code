@@ -28,6 +28,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
+  type SimulatorCapabilities,
   ThreadId,
   WS_METHODS,
   WsRpcGroup,
@@ -121,6 +122,8 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
+import * as SimulatorAutomation from "./simulator/Automation.ts";
+import * as SimulatorManager from "./simulator/Manager.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
@@ -741,6 +744,20 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mergeAll(
+          Layer.mock(SimulatorAutomation.SimulatorAutomation)({}),
+          Layer.mock(SimulatorManager.SimulatorManager)({
+            capabilities: Effect.succeed({
+              host: { os: "unknown", arch: "other" },
+              platformSupported: false,
+              executionReady: false,
+              deviceEnumeration: false,
+              liveStreaming: false,
+              humanInput: false,
+              agentAutomation: false,
+              maxActive: 0,
+              reason: "unsupported-platform",
+            } satisfies SimulatorCapabilities),
+          }),
           Layer.mock(PreviewManager.PreviewManager)({
             open: () => Effect.die("PreviewManager not stubbed in this test"),
             navigate: () => Effect.die("PreviewManager not stubbed in this test"),
@@ -5233,6 +5250,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 },
                 branch: "feature/demo",
                 worktreePath: null,
+                isOnPullRequestHead: true,
               }),
           },
           gitVcsDriver: {
@@ -7018,6 +7036,126 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           ["thread.archive"],
         );
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("stops the provider session after settle without closing terminals", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-settle");
+      const effects: string[] = [];
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* buildAppUnderTest({
+        layers: {
+          terminalManager: {
+            close: (input) =>
+              Effect.sync(() => {
+                effects.push(`terminal.close:${input.threadId}`);
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                effects.push(`dispatch:${command.type}`);
+                return { sequence: dispatchedCommands.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.succeed(
+                Option.some(
+                  makeDefaultOrchestrationThreadShell({
+                    id: threadId,
+                    updatedAt: now,
+                    session: {
+                      threadId,
+                      status: "ready",
+                      providerName: "claudeAgent",
+                      runtimeMode: "full-access",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: now,
+                    },
+                  }),
+                ),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const dispatchResult = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.settle",
+            commandId: CommandId.make("cmd-thread-settle"),
+            threadId,
+          }),
+        ),
+      );
+
+      assert.equal(dispatchResult.sequence, 1);
+      assert.deepEqual(effects, ["dispatch:thread.settle", "dispatch:thread.session.stop"]);
+      const sessionStopCommand = dispatchedCommands[1];
+      assert.equal(sessionStopCommand?.type, "thread.session.stop");
+      if (sessionStopCommand?.type === "thread.session.stop") {
+        assert.equal(sessionStopCommand.threadId, threadId);
+        assert.equal(sessionStopCommand.commandId, "session-stop-for-settle:cmd-thread-settle");
+        assert.equal(sessionStopCommand.onlyIfSettled, true);
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("settles without dispatching session stop when the thread has no session", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-settle-no-session");
+      const effects: string[] = [];
+      const dispatchedCommands: Array<OrchestrationCommand> = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          terminalManager: {
+            close: (input) =>
+              Effect.sync(() => {
+                effects.push(`terminal.close:${input.threadId}`);
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatchedCommands.push(command);
+                effects.push(`dispatch:${command.type}`);
+                return { sequence: dispatchedCommands.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.succeed(
+                Option.some(makeDefaultOrchestrationThreadShell({ id: threadId, session: null })),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const dispatchResult = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.settle",
+            commandId: CommandId.make("cmd-thread-settle-no-session"),
+            threadId,
+          }),
+        ),
+      );
+
+      assert.equal(dispatchResult.sequence, 1);
+      assert.deepEqual(effects, ["dispatch:thread.settle"]);
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.settle"],
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("archives and still closes terminals when session stop fails", () =>

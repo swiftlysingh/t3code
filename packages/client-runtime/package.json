@@ -79,9 +79,17 @@
       "types": "./src/state/preview.ts",
       "default": "./src/state/preview.ts"
     },
+    "./state/simulator": {
+      "types": "./src/state/simulator.ts",
+      "default": "./src/state/simulator.ts"
+    },
     "./state/projects": {
       "types": "./src/state/projects.ts",
       "default": "./src/state/projects.ts"
+    },
+    "./state/pull-requests": {
+      "types": "./src/state/pullRequests.ts",
+      "default": "./src/state/pullRequests.ts"
     },
     "./state/project-grouping": {
       "types": "./src/state/projectGrouping.ts",

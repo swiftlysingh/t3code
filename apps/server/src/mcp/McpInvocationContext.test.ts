@@ -9,6 +9,26 @@ import * as Effect from "effect/Effect";
 
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
+it.effect("returns the invocation scope for every granted capability", () => {
+  const invocation: McpInvocationContext.McpInvocationScope = {
+    environmentId: EnvironmentId.make("environment-1"),
+    threadId: ThreadId.make("thread-1"),
+    providerSessionId: "provider-session-1",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    capabilities: new Set(["preview", "ios-simulator"] as const),
+    issuedAt: 1,
+  };
+
+  return Effect.gen(function* () {
+    for (const capability of ["preview", "ios-simulator"] as const) {
+      const resolved = yield* McpInvocationContext.requireMcpCapability(capability).pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      );
+      expect(resolved).toBe(invocation);
+    }
+  });
+});
+
 it.effect("reports the scoped credential context when preview capability is unavailable", () => {
   const invocation: McpInvocationContext.McpInvocationScope = {
     environmentId: EnvironmentId.make("environment-1"),
@@ -36,3 +56,34 @@ it.effect("reports the scoped credential context when preview capability is unav
     expect(error.message).toBe("MCP credential does not grant the preview capability.");
   });
 });
+
+it.effect(
+  "reports the scoped credential context when iOS Simulator capability is unavailable",
+  () => {
+    const invocation: McpInvocationContext.McpInvocationScope = {
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: ThreadId.make("thread-1"),
+      providerSessionId: "provider-session-1",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      capabilities: new Set(["preview"] as const),
+      issuedAt: 1,
+    };
+
+    return Effect.gen(function* () {
+      const error = yield* McpInvocationContext.requireMcpCapability("ios-simulator").pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+        Effect.flip,
+      );
+
+      expect(error).toBeInstanceOf(McpInvocationContext.McpCapabilityUnavailableError);
+      expect(error).toMatchObject({
+        capability: "ios-simulator",
+        environmentId: invocation.environmentId,
+        threadId: invocation.threadId,
+        providerSessionId: invocation.providerSessionId,
+        providerInstanceId: invocation.providerInstanceId,
+      });
+      expect(error.message).toBe("MCP credential does not grant the ios-simulator capability.");
+    });
+  },
+);

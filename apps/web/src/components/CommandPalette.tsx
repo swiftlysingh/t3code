@@ -20,6 +20,7 @@ import {
   type EnvironmentId,
   type FilesystemBrowseResult,
   type ProjectId,
+  type ScopedThreadRef,
   type SourceControlDiscoveryResult,
   type SourceControlProviderKind,
   type SourceControlRepositoryInfo,
@@ -37,6 +38,7 @@ import {
   MessageSquareIcon,
   PaletteIcon,
   SettingsIcon,
+  SmartphoneIcon,
   SquarePenIcon,
   TextSearchIcon,
 } from "lucide-react";
@@ -150,6 +152,7 @@ function projectFavicon(project: Project) {
     <ProjectFavicon
       environmentId={project.environmentId}
       cwd={project.workspaceRoot}
+      faviconPath={project.faviconPath}
       className={ITEM_ICON_CLASS}
     />
   );
@@ -486,6 +489,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           open={state.open}
           mode={state.mode}
           openIntent={state.openIntent}
+          routeThreadRef={routeThreadRef}
           setOpen={setOpen}
           openOverlayMode={toggleMode}
           clearOpenIntent={clearOpenIntent}
@@ -499,6 +503,7 @@ function CommandPaletteDialog(props: {
   readonly open: boolean;
   readonly mode: SearchOverlayMode;
   readonly openIntent: CommandPaletteOpenIntent | null;
+  readonly routeThreadRef: ScopedThreadRef | null;
   readonly setOpen: (open: boolean) => void;
   readonly openOverlayMode: (mode: SearchOverlayMode) => void;
   readonly clearOpenIntent: () => void;
@@ -537,6 +542,7 @@ function CommandPaletteDialog(props: {
       ) : (
         <OpenCommandPaletteDialog
           openIntent={props.openIntent}
+          routeThreadRef={props.routeThreadRef}
           setOpen={props.setOpen}
           openOverlayMode={props.openOverlayMode}
           clearOpenIntent={props.clearOpenIntent}
@@ -548,12 +554,13 @@ function CommandPaletteDialog(props: {
 
 function OpenCommandPaletteDialog(props: {
   readonly openIntent: CommandPaletteOpenIntent | null;
+  readonly routeThreadRef: ScopedThreadRef | null;
   readonly setOpen: (open: boolean) => void;
   readonly openOverlayMode: (mode: SearchOverlayMode) => void;
   readonly clearOpenIntent: () => void;
 }) {
   const navigate = useNavigate();
-  const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
+  const { clearOpenIntent, openIntent, openOverlayMode, routeThreadRef, setOpen } = props;
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const isActionsOnly = deferredQuery.startsWith(">");
@@ -1433,6 +1440,19 @@ function OpenCommandPaletteDialog(props: {
     },
   });
 
+  if (routeThreadRef !== null) {
+    actionItems.push({
+      kind: "action",
+      value: "action:open-simulator",
+      searchTerms: ["simulator", "iOS", "iPhone", "device", "run app"],
+      title: "Open Simulator",
+      icon: <SmartphoneIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        useRightPanelStore.getState().open(routeThreadRef, "simulator");
+      },
+    });
+  }
+
   actionItems.push({
     kind: "action",
     value: "action:add-project",
@@ -1504,6 +1524,33 @@ function OpenCommandPaletteDialog(props: {
       await navigate({ to: "/settings" });
     },
   });
+
+  // There is no projects listing page; the action targets the contextual
+  // project (active thread/draft, falling back to the first sidebar group).
+  const contextualProjectGroup =
+    (contextualProjectRef
+      ? projectGroupByTargetKey.get(
+          `${contextualProjectRef.environmentId}:${contextualProjectRef.projectId}`,
+        )
+      : null) ??
+    projectGroups[0] ??
+    null;
+  if (contextualProjectGroup) {
+    actionItems.push({
+      kind: "action",
+      value: "action:project-settings",
+      searchTerms: ["project", "settings", "scripts", "model", "grouping", "checkout"],
+      title: "Project settings",
+      description: contextualProjectGroup.displayName,
+      icon: <FolderIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({
+          to: "/projects/$projectKey",
+          params: { projectKey: contextualProjectGroup.projectKey },
+        });
+      },
+    });
+  }
 
   const rootGroups = buildRootGroups({ actionItems, recentThreadItems });
   const sourceSelectionViewValue =

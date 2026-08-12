@@ -1,10 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  type SimulatorCapabilities,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as SimulatorManager from "../simulator/Manager.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -19,16 +26,35 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getDescriptor: Effect.die("unused"),
 });
 
-const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
+const simulatorCapabilities = (executionReady: boolean): SimulatorCapabilities => ({
+  host: { os: "darwin", arch: "arm64" },
+  platformSupported: true,
+  executionReady,
+  deviceEnumeration: executionReady,
+  liveStreaming: executionReady,
+  humanInput: executionReady,
+  agentAutomation: executionReady,
+  maxActive: 1,
+  reason: executionReady ? null : "dependency-unavailable",
+});
+
+const makeRegistry = (now: () => number, httpServer = fakeHttpServer, executionReady = true) =>
   McpSessionRegistry.__testing
     .make({
       now,
       livenessWindowMs: 100,
     })
     .pipe(
-      Effect.provideService(HttpServer.HttpServer, httpServer),
-      Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
-      Effect.provide(NodeServices.layer),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(HttpServer.HttpServer, httpServer),
+          Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+          Layer.mock(SimulatorManager.SimulatorManager)({
+            capabilities: Effect.succeed(simulatorCapabilities(executionReady)),
+          }),
+          NodeServices.layer,
+        ),
+      ),
     );
 
 it.effect("stores only a token hash, resolves the bearer token, and revokes by thread", () =>
@@ -46,11 +72,25 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
 
     const resolved = yield* registry.resolve(token);
     expect(resolved?.threadId).toBe(threadId);
+    expect(resolved?.capabilities).toEqual(new Set(["preview", "ios-simulator"]));
 
     yield* registry.revokeThread(threadId);
     expect(yield* registry.resolve(token)).toBeUndefined();
 
     timestamp += 2_000;
+  }),
+);
+
+it.effect("does not grant iOS Simulator tools when the host is not execution-ready", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000, fakeHttpServer, false);
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-no-simulator"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    expect((yield* registry.resolve(token))?.capabilities).toEqual(new Set(["preview"]));
   }),
 );
 

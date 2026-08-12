@@ -4,8 +4,10 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   migratePersistedRightPanelState,
+  pullRequestSurfaceId,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
+  selectSelectedRightPanelSurface,
   selectThreadRightPanelState,
   useRightPanelStore,
 } from "./rightPanelStore";
@@ -14,7 +16,7 @@ const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"))
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, revealedSimulatorLeaseKeys: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -102,6 +104,78 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("upgrades the legacy singleton pull request surface to a reference-keyed tab", () => {
+    const id = pullRequestSurfaceId({
+      projectId: "project-a",
+      repository: "pingdotgg/t3code",
+      number: 4909,
+    });
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: true,
+            activeSurfaceId: "pull-request",
+            surfaces: [
+              {
+                id: "pull-request",
+                kind: "pull-request",
+                projectId: "project-a",
+                repository: "pingdotgg/t3code",
+                number: 4909,
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          activeSurfaceId: id,
+          surfaces: [
+            {
+              id,
+              kind: "pull-request",
+              projectId: "project-a",
+              repository: "pingdotgg/t3code",
+              number: 4909,
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("drops the pull-request list's shared panel so a restart opens the page fresh", () => {
+    const id = pullRequestSurfaceId({
+      projectId: "project-a",
+      repository: "pingdotgg/t3code",
+      number: 4909,
+    });
+    const panelState = {
+      isOpen: true,
+      activeSurfaceId: id,
+      surfaces: [
+        {
+          id,
+          kind: "pull-request" as const,
+          projectId: "project-a",
+          repository: "pingdotgg/t3code",
+          number: 4909,
+        },
+      ],
+    };
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          "env-1:pull-requests-panel": panelState,
+          "env-1:thread-A": panelState,
+        },
+      }),
+    ).toEqual({ byThreadKey: { "env-1:thread-A": panelState } });
+  });
+
   it("drops persisted plan surfaces and does not reopen an empty panel", () => {
     expect(
       migratePersistedRightPanelState({
@@ -174,6 +248,104 @@ describe("rightPanelStore", () => {
       isOpen: true,
       activeSurfaceId: "files",
       surfaces: [{ id: "files", kind: "files" }],
+    });
+  });
+
+  it("keeps Simulator as one thread-scoped singleton surface", () => {
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().open(refB, "simulator");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refB)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+  });
+
+  it("opens a closed or empty panel on Simulator", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().close(refA);
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [
+        { id: "agents", kind: "agents" },
+        { id: "simulator", kind: "simulator" },
+      ],
+    });
+
+    useRightPanelStore.getState().closeAllSurfaces(refA);
+    useRightPanelStore.getState().toggleVisibility(refA);
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-2:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+  });
+
+  it("adds Simulator without stealing an active surface", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "agents",
+      surfaces: [
+        { id: "agents", kind: "agents" },
+        { id: "simulator", kind: "simulator" },
+      ],
+    });
+  });
+
+  it("is idempotent when ensuring an existing Simulator surface", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    const firstState = useRightPanelStore.getState().byThreadKey;
+    const firstThreadState = firstState["env-1:thread-A"];
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]).toBe(firstThreadState);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([
+      { id: "agents", kind: "agents" },
+      { id: "simulator", kind: "simulator" },
+    ]);
+  });
+
+  it("respects dismissal until a new Simulator lease is revealed", () => {
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    useRightPanelStore.getState().closeSurface(refA, "simulator");
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-2:1");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe(
+      "simulator",
+    );
+  });
+
+  it("selects a neighboring surface when closing Simulator", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().open(refA, "simulator");
+    useRightPanelStore.getState().closeSurface(refA, "simulator");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "agents",
+      surfaces: [{ id: "agents", kind: "agents" }],
     });
   });
 
@@ -266,6 +438,9 @@ describe("rightPanelStore", () => {
     useRightPanelStore.getState().open(refA, "agents");
     useRightPanelStore.getState().close(refA);
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+    expect(
+      selectSelectedRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toEqual({ id: "agents", kind: "agents" });
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
       isOpen: false,
       activeSurfaceId: "agents",
@@ -305,8 +480,10 @@ describe("rightPanelStore", () => {
 
   it("removeThread clears persisted state", () => {
     useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
     useRightPanelStore.getState().removeThread(refA);
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+    expect(useRightPanelStore.getState().revealedSimulatorLeaseKeys).toEqual({});
   });
 
   it("close on never-opened thread is a no-op", () => {
@@ -325,6 +502,21 @@ describe("rightPanelStore", () => {
       kind: "preview",
       resourceId: "tab-b",
     });
+  });
+
+  it("tracks one surface per pull request", () => {
+    const first = { projectId: "project-a", repository: "pingdotgg/t3code", number: 4909 };
+    const second = { projectId: "project-a", repository: "pingdotgg/t3code", number: 4910 };
+    useRightPanelStore.getState().openPullRequest(refA, first);
+    useRightPanelStore.getState().openPullRequest(refA, second);
+    useRightPanelStore.getState().openPullRequest(refA, first);
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.surfaces.map((surface) => surface.id)).toEqual([
+      pullRequestSurfaceId(first),
+      pullRequestSurfaceId(second),
+    ]);
+    expect(state.activeSurfaceId).toBe(pullRequestSurfaceId(first));
   });
 
   it("tracks one surface per terminal session", () => {

@@ -52,6 +52,23 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverGetBackgroundPolicy]: AuthOrchestrationReadScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,
+  [WS_METHODS.pullRequestsList]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsListStats]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsDetail]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsActivity]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsDiffFileContents]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsRunAction]: AuthOrchestrationOperateScope,
+  [WS_METHODS.pullRequestsComment]: AuthOrchestrationOperateScope,
+  [WS_METHODS.pullRequestsSubmitReview]: AuthOrchestrationOperateScope,
+  [WS_METHODS.pullRequestsReplyToThread]: AuthOrchestrationOperateScope,
+  [WS_METHODS.pullRequestsSetThreadResolution]: AuthOrchestrationOperateScope,
+  // Read scope like the reads it un-caches: refreshing is part of reading, and a read-only
+  // client pressing refresh must not be told it may not look again.
+  [WS_METHODS.pullRequestsInvalidate]: AuthOrchestrationReadScope,
+  // The candidate list is a read like the detail beside it; asking somebody for a review is a
+  // write like every other one.
+  [WS_METHODS.pullRequestsReviewerCandidates]: AuthOrchestrationReadScope,
+  [WS_METHODS.pullRequestsRequestReviewers]: AuthOrchestrationOperateScope,
   [WS_METHODS.sourceControlLookupRepository]: AuthOrchestrationReadScope,
   [WS_METHODS.sourceControlCloneRepository]: AuthOrchestrationOperateScope,
   [WS_METHODS.sourceControlPublishRepository]: AuthOrchestrationOperateScope,
@@ -97,12 +114,20 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.previewAutomationConnect]: AuthOrchestrationOperateScope,
   [WS_METHODS.previewAutomationRespond]: AuthOrchestrationOperateScope,
   [WS_METHODS.previewAutomationFocusHost]: AuthOrchestrationOperateScope,
+  [WS_METHODS.simulatorCapabilities]: AuthOrchestrationReadScope,
+  [WS_METHODS.simulatorList]: AuthOrchestrationReadScope,
+  [WS_METHODS.simulatorAcquire]: AuthOrchestrationOperateScope,
+  [WS_METHODS.simulatorStatus]: AuthOrchestrationReadScope,
+  [WS_METHODS.simulatorOpen]: AuthOrchestrationOperateScope,
+  [WS_METHODS.simulatorRelease]: AuthOrchestrationOperateScope,
+  [WS_METHODS.simulatorSendInput]: AuthOrchestrationOperateScope,
   [WS_METHODS.subscribePreviewEvents]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeDiscoveredLocalServers]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeServerConfig]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeServerLifecycle]: AuthOrchestrationReadScope,
   [WS_METHODS.subscribeAuthAccess]: AuthAccessReadScope,
   [WS_METHODS.subscribeBackgroundPolicy]: AuthOrchestrationReadScope,
+  [WS_METHODS.subscribeSimulatorEvents]: AuthOrchestrationReadScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

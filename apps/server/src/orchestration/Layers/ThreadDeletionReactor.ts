@@ -7,6 +7,8 @@ import * as Stream from "effect/Stream";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
+import * as SimulatorAutomation from "../../simulator/Automation.ts";
+import * as SimulatorManager from "../../simulator/Manager.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ThreadDeletionReactor,
@@ -15,6 +17,11 @@ import {
 import { forkParked } from "../../serverActivation.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
+type ThreadSimulatorManager = Pick<SimulatorManager.SimulatorManager["Service"], "releaseThread">;
+type ThreadSimulatorAutomationCloser = Pick<
+  SimulatorAutomation.SimulatorAutomation["Service"],
+  "closeThread"
+>;
 
 export const logCleanupCauseUnlessInterrupted = <R, E>({
   effect,
@@ -37,10 +44,48 @@ export const logCleanupCauseUnlessInterrupted = <R, E>({
     }),
   );
 
+/**
+ * Thread deletion must always hand the lease back to Manager. The automation
+ * child is a best-effort pre-close; a failed child close cannot be allowed to
+ * leave Manager's sidecar and host/device locks allocated.
+ */
+export const releaseThreadAfterAutomationClose = Effect.fn(
+  "ThreadDeletionReactor.releaseThreadAfterAutomationClose",
+)(function* (
+  simulatorManager: ThreadSimulatorManager,
+  simulatorAutomation: ThreadSimulatorAutomationCloser,
+  threadId: ThreadDeletedEvent["payload"]["threadId"],
+) {
+  return yield* simulatorAutomation.closeThread(threadId).pipe(
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
+      return Effect.logWarning("thread deletion cleanup failed to close simulator automation", {
+        threadId,
+        cause: Cause.pretty(cause),
+      });
+    }),
+    // Thread deletion can be interrupted while a child shuts down. Release
+    // the Manager-owned lease in the uninterruptible onError finalizer too.
+    Effect.onError(() =>
+      simulatorManager.releaseThread(threadId).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("thread deletion cleanup failed to release Simulator lease", {
+            threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      ),
+    ),
+    Effect.andThen(simulatorManager.releaseThread(threadId)),
+  );
+});
+
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
   const terminalManager = yield* TerminalManager.TerminalManager;
+  const simulatorAutomation = yield* SimulatorAutomation.SimulatorAutomation;
+  const simulatorManager = yield* SimulatorManager.SimulatorManager;
 
   const stopProviderSession = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
     logCleanupCauseUnlessInterrupted({
@@ -56,12 +101,20 @@ const make = Effect.gen(function* () {
       threadId,
     });
 
+  const closeThreadSimulator = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
+    logCleanupCauseUnlessInterrupted({
+      effect: releaseThreadAfterAutomationClose(simulatorManager, simulatorAutomation, threadId),
+      message: "thread deletion cleanup failed to release Simulator lease",
+      threadId,
+    });
+
   const processThreadDeleted = Effect.fn("processThreadDeleted")(function* (
     event: ThreadDeletedEvent,
   ) {
     const { threadId } = event.payload;
     yield* stopProviderSession(threadId);
     yield* closeThreadTerminals(threadId);
+    yield* closeThreadSimulator(threadId);
   });
 
   const processThreadDeletedSafely = (event: ThreadDeletedEvent) =>
