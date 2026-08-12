@@ -81,10 +81,12 @@ export interface ThreadRightPanelState {
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  revealedSimulatorLeaseKeys: Record<string, string>;
   open: (
     ref: ScopedThreadRef,
     kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
   ) => void;
+  ensureSimulatorSurface: (ref: ScopedThreadRef, leaseKey: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   openPullRequest: (
@@ -332,6 +334,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set) => ({
       byThreadKey: {},
+      revealedSimulatorLeaseKeys: {},
       open: (ref, kind) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
@@ -342,6 +345,34 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             return upsertSurface(current, singletonSurface(kind));
           }),
         })),
+      ensureSimulatorSurface: (ref, leaseKey) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          if (state.revealedSimulatorLeaseKeys[threadKey] === leaseKey) return state;
+          return {
+            revealedSimulatorLeaseKeys: {
+              ...state.revealedSimulatorLeaseKeys,
+              [threadKey]: leaseKey,
+            },
+            byThreadKey: updateThread(state.byThreadKey, threadKey, (current) => {
+              const hasSimulator = current.surfaces.some((surface) => surface.id === "simulator");
+              const hasActiveSurface =
+                current.isOpen &&
+                current.activeSurfaceId !== null &&
+                current.surfaces.some((surface) => surface.id === current.activeSurfaceId);
+
+              if (hasSimulator && hasActiveSurface) return current;
+
+              return {
+                isOpen: true,
+                surfaces: hasSimulator
+                  ? current.surfaces
+                  : [...current.surfaces, singletonSurface("simulator")],
+                activeSurfaceId: hasActiveSurface ? current.activeSurfaceId : "simulator",
+              };
+            }),
+          };
+        }),
       openBrowser: (ref, tabId) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
@@ -615,9 +646,16 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.byThreadKey)) return state;
+          if (
+            !(threadKey in state.byThreadKey) &&
+            !(threadKey in state.revealedSimulatorLeaseKeys)
+          ) {
+            return state;
+          }
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
-          return { byThreadKey: rest };
+          const { [threadKey]: _removedLease, ...revealedSimulatorLeaseKeys } =
+            state.revealedSimulatorLeaseKeys;
+          return { byThreadKey: rest, revealedSimulatorLeaseKeys };
         }),
     }),
     {

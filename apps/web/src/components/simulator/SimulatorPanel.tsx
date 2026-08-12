@@ -9,7 +9,6 @@ import * as Cause from "effect/Cause";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   CircleAlert,
-  CircleCheck,
   CircleX,
   CopyIcon,
   EllipsisIcon,
@@ -17,6 +16,9 @@ import {
   Home,
   InfoIcon,
   LoaderCircle,
+  Maximize2,
+  Minus,
+  Plus,
   RefreshCw,
   RotateCcw,
   RotateCw,
@@ -45,18 +47,21 @@ import {
   clampSimulatorScrollDelta,
   deriveSimulatorPanelViewState,
   enqueueSimulatorInput,
+  fitSimulatorDisplayWidth,
   hidUsageForKeyboardCode,
   mapPointToContainedMedia,
   nextSimulatorOrientation,
   resolveSimulatorStreamUrl,
+  type SimulatorDisplayScale,
   simulatorMediaDimensionsForOrientation,
+  stepSimulatorDisplayScale,
   type ContainedMediaPoint,
-  type SimulatorPanelViewState,
 } from "./SimulatorPanel.helpers";
 
 const MOVE_INTERVAL_MS = 1000 / 30;
 const MAX_STREAM_RETRIES = 3;
 const TRANSITION_REFRESH_MS = 1_500;
+const DEFAULT_DISPLAY_WIDTH = 320;
 
 type StreamState = "waiting" | "connecting" | "live" | "reconnecting" | "unavailable";
 
@@ -195,6 +200,8 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
   const [streamAttempt, setStreamAttempt] = useState(0);
   const [optimisticMedia, setOptimisticMedia] = useState<OptimisticSimulatorMedia | null>(null);
   const [sessionDetailsOpen, setSessionDetailsOpen] = useState(false);
+  const [displayScale, setDisplayScale] = useState<SimulatorDisplayScale>(1);
+  const [fitDisplayWidth, setFitDisplayWidth] = useState<number | null>(null);
   const { copyToClipboard, isCopied: hasCopiedDeviceId } = useCopyToClipboard({
     target: "device ID",
     onError: (error) => setActionError(error.message),
@@ -202,6 +209,8 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
   const lastEventSequence = useRef<number | null>(null);
   const releasedLeaseKeys = useRef(new Set<string>());
   const streamRetryTimer = useRef<number | null>(null);
+  const panelViewportRef = useRef<HTMLDivElement | null>(null);
+  const simulatorStageRef = useRef<HTMLDivElement | null>(null);
   const simulatorOverlayRef = useRef<HTMLDivElement | null>(null);
   const activeTouch = useRef<ActiveTouch | null>(null);
   const activeKeyboardUsages = useRef(new Map<number, SimulatorSession>());
@@ -292,7 +301,35 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
 
   useEffect(() => {
     setSessionDetailsOpen(false);
+    setDisplayScale(1);
+    setFitDisplayWidth(null);
   }, [sessionKey]);
+
+  useEffect(() => {
+    if (displayScale !== "fit" || !mediaDimensions) return;
+    const viewport = panelViewportRef.current;
+    const stage = simulatorStageRef.current;
+    const overlay = simulatorOverlayRef.current;
+    if (!viewport || !stage || !overlay) return;
+
+    const updateFitWidth = () => {
+      const viewportBounds = viewport.getBoundingClientRect();
+      const screenBounds = overlay.getBoundingClientRect();
+      const screenTop = screenBounds.top - viewportBounds.top + viewport.scrollTop;
+      const width = fitSimulatorDisplayWidth({
+        availableWidth: stage.clientWidth,
+        availableHeight: viewport.clientHeight - screenTop - 12,
+        media: mediaDimensions,
+      });
+      setFitDisplayWidth((current) => (current === width ? current : width));
+    };
+
+    updateFitWidth();
+    const observer = new ResizeObserver(updateFitWidth);
+    observer.observe(viewport);
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [displayScale, mediaDimensions]);
 
   useEffect(() => {
     const next = defaultSelectedDevice(devices);
@@ -765,10 +802,18 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
     (capabilities && !capabilities.executionReady
       ? "This environment cannot start iOS Simulator tooling yet."
       : "The Simulator session could not be started.");
+  const displayScaleLabel = displayScale === "fit" ? "Fit" : `${displayScale * 100}%`;
+  const fittedScale = (fitDisplayWidth ?? DEFAULT_DISPLAY_WIDTH) / DEFAULT_DISPLAY_WIDTH;
+  const smallerDisplayScale = stepSimulatorDisplayScale(displayScale, "out", fittedScale);
+  const largerDisplayScale = stepSimulatorDisplayScale(displayScale, "in", fittedScale);
+  const displayMaxWidth =
+    displayScale === "fit"
+      ? `${fitDisplayWidth ?? DEFAULT_DISPLAY_WIDTH}px`
+      : `${DEFAULT_DISPLAY_WIDTH * displayScale}px`;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background" data-simulator-panel>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2 sm:p-3">
+      <div ref={panelViewportRef} className="min-h-0 flex-1 overflow-y-auto p-2 sm:p-3">
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-3">
           {state === "loading" ? (
             <section className="flex items-center gap-2 rounded-lg border border-border/80 bg-card p-3 text-sm text-muted-foreground">
@@ -931,12 +976,9 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
               ) : null}
 
               {state === "ready" && session ? (
-                <section
-                  className="overflow-hidden rounded-lg border border-border/80 bg-card"
-                  data-simulator-session
-                >
-                  <div className="flex items-center justify-between gap-3 border-b border-border/70 px-3 py-2">
-                    <h3 className="min-w-0 truncate text-sm font-medium text-foreground">
+                <section className="flex flex-col" data-simulator-session>
+                  <div className="flex items-center justify-between gap-3 px-1 pb-2">
+                    <h3 className="min-w-0 truncate text-xs font-medium text-foreground">
                       {sessionDeviceLabel}
                     </h3>
                     <div className="flex shrink-0 items-center gap-1">
@@ -944,7 +986,7 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                         className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300"
                         aria-live="polite"
                       >
-                        <CircleCheck className="size-3.5" aria-hidden />
+                        <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden />
                         Ready
                       </span>
                       <Menu>
@@ -997,13 +1039,90 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                     </div>
                   </div>
 
-                  <div className="p-2 sm:p-3">
+                  <div ref={simulatorStageRef} className="flex flex-col items-center">
                     <div
-                      className="relative mx-auto w-full overflow-hidden rounded-xl border border-border/70 bg-black shadow-inner"
+                      className="mb-2 flex w-fit items-center justify-center gap-0.5 rounded-full border border-border/60 bg-background/90 p-0.5 shadow-sm"
+                      data-simulator-controls
+                    >
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Make Simulator smaller"
+                        title="Zoom out"
+                        disabled={smallerDisplayScale === displayScale}
+                        onClick={() => setDisplayScale(smallerDisplayScale)}
+                      >
+                        <Minus aria-hidden />
+                      </Button>
+                      <span
+                        className="min-w-9 text-center text-[10px] tabular-nums text-muted-foreground"
+                        aria-live="polite"
+                      >
+                        {displayScaleLabel}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Make Simulator larger"
+                        title="Zoom in"
+                        disabled={largerDisplayScale === displayScale}
+                        onClick={() => setDisplayScale(largerDisplayScale)}
+                      >
+                        <Plus aria-hidden />
+                      </Button>
+                      <Button
+                        variant={displayScale === "fit" ? "secondary" : "ghost"}
+                        size="icon-xs"
+                        aria-label="Fit Simulator to panel"
+                        aria-pressed={displayScale === "fit"}
+                        title="Fit to panel"
+                        onClick={() => setDisplayScale("fit")}
+                      >
+                        <Maximize2 aria-hidden />
+                      </Button>
+                      <span className="mx-0.5 h-3.5 w-px bg-border/70" aria-hidden />
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Rotate Simulator counterclockwise"
+                        title="Rotate counterclockwise"
+                        disabled={!controlsEnabled}
+                        onClick={() => rotate("counterclockwise")}
+                      >
+                        <RotateCcw aria-hidden />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Go to Simulator Home screen"
+                        title="Home"
+                        disabled={!controlsEnabled}
+                        onClick={sendHome}
+                      >
+                        <Home aria-hidden />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Rotate Simulator clockwise"
+                        title="Rotate clockwise"
+                        disabled={!controlsEnabled}
+                        onClick={() => rotate("clockwise")}
+                      >
+                        <RotateCw aria-hidden />
+                      </Button>
+                    </div>
+
+                    <div
+                      className="relative w-full overflow-hidden rounded-xl border border-border/70 bg-black shadow-inner"
+                      data-simulator-screen
                       style={
                         mediaDimensions
-                          ? { aspectRatio: `${mediaDimensions.width} / ${mediaDimensions.height}` }
-                          : { aspectRatio: "9 / 19.5" }
+                          ? {
+                              aspectRatio: `${mediaDimensions.width} / ${mediaDimensions.height}`,
+                              maxWidth: displayMaxWidth,
+                            }
+                          : { aspectRatio: "9 / 19.5", maxWidth: displayMaxWidth }
                       }
                     >
                       {streamSrc ? (
@@ -1052,48 +1171,17 @@ export function SimulatorPanel({ threadRef }: { readonly threadRef: ScopedThread
                       />
                     </div>
 
-                    <div className="mt-2 flex items-center justify-center gap-1 rounded-md bg-muted/50 p-1">
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        aria-label="Rotate Simulator counterclockwise"
-                        title="Rotate counterclockwise"
-                        disabled={!controlsEnabled}
-                        onClick={() => rotate("counterclockwise")}
-                      >
-                        <RotateCcw aria-hidden />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        aria-label="Go to Simulator Home screen"
-                        title="Home"
-                        disabled={!controlsEnabled}
-                        onClick={sendHome}
-                      >
-                        <Home aria-hidden />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon-xs"
-                        aria-label="Rotate Simulator clockwise"
-                        title="Rotate clockwise"
-                        disabled={!controlsEnabled}
-                        onClick={() => rotate("clockwise")}
-                      >
-                        <RotateCw aria-hidden />
-                      </Button>
+                    <div className="w-full max-w-[560px]">
+                      <Collapsible open={sessionDetailsOpen} onOpenChange={setSessionDetailsOpen}>
+                        <CollapsiblePanel>
+                          <dl className="mt-2 grid gap-1.5 rounded-md border border-border/60 bg-muted/20 p-2">
+                            <DetailRow label="Device ID" value={session.udid} code />
+                            <DetailRow label="Lease" value={session.leaseId} code />
+                            <DetailRow label="Generation" value={String(session.generation)} code />
+                          </dl>
+                        </CollapsiblePanel>
+                      </Collapsible>
                     </div>
-
-                    <Collapsible open={sessionDetailsOpen} onOpenChange={setSessionDetailsOpen}>
-                      <CollapsiblePanel>
-                        <dl className="mt-2 grid gap-1.5 border-t border-border/70 pt-2">
-                          <DetailRow label="Device ID" value={session.udid} code />
-                          <DetailRow label="Lease" value={session.leaseId} code />
-                          <DetailRow label="Generation" value={String(session.generation)} code />
-                        </dl>
-                      </CollapsiblePanel>
-                    </Collapsible>
                   </div>
                 </section>
               ) : null}

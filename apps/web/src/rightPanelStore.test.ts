@@ -16,7 +16,7 @@ const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"))
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, revealedSimulatorLeaseKeys: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -268,6 +268,75 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("opens a closed or empty panel on Simulator", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().close(refA);
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [
+        { id: "agents", kind: "agents" },
+        { id: "simulator", kind: "simulator" },
+      ],
+    });
+
+    useRightPanelStore.getState().closeAllSurfaces(refA);
+    useRightPanelStore.getState().toggleVisibility(refA);
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-2:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "simulator",
+      surfaces: [{ id: "simulator", kind: "simulator" }],
+    });
+  });
+
+  it("adds Simulator without stealing an active surface", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "agents",
+      surfaces: [
+        { id: "agents", kind: "agents" },
+        { id: "simulator", kind: "simulator" },
+      ],
+    });
+  });
+
+  it("is idempotent when ensuring an existing Simulator surface", () => {
+    useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    const firstState = useRightPanelStore.getState().byThreadKey;
+    const firstThreadState = firstState["env-1:thread-A"];
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+
+    expect(useRightPanelStore.getState().byThreadKey["env-1:thread-A"]).toBe(firstThreadState);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([
+      { id: "agents", kind: "agents" },
+      { id: "simulator", kind: "simulator" },
+    ]);
+  });
+
+  it("respects dismissal until a new Simulator lease is revealed", () => {
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    useRightPanelStore.getState().closeSurface(refA, "simulator");
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-2:1");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe(
+      "simulator",
+    );
+  });
+
   it("selects a neighboring surface when closing Simulator", () => {
     useRightPanelStore.getState().open(refA, "agents");
     useRightPanelStore.getState().open(refA, "simulator");
@@ -411,8 +480,10 @@ describe("rightPanelStore", () => {
 
   it("removeThread clears persisted state", () => {
     useRightPanelStore.getState().open(refA, "agents");
+    useRightPanelStore.getState().ensureSimulatorSurface(refA, "lease-1:1");
     useRightPanelStore.getState().removeThread(refA);
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+    expect(useRightPanelStore.getState().revealedSimulatorLeaseKeys).toEqual({});
   });
 
   it("close on never-opened thread is a no-op", () => {

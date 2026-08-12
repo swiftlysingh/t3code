@@ -24,23 +24,34 @@ the machine that runs the Simulator.
 ## Open a session
 
 1. Open the thread that owns the iOS project.
-2. Open the Command Palette and choose **Open Simulator**, or open the **Simulator** panel from
-   the right-side panels.
+2. Ask the agent to use its iOS workflow, or open the Command Palette and choose **Open
+   Simulator** yourself.
 3. Check the host status and device list. T3 shows the device name, runtime, and exact UDID so you
    can tell which Simulator the session uses.
 4. Choose one of the available exact devices.
-5. Choose **Start session** or ask the agent to use its iOS workflow. T3 reserves and boots the
-   device and opens the live view when the first real frame is ready. Starting a session does not
-   guess which Xcode project or scheme to build; the agent's build-and-run tool supplies those
+5. Choose **Start session** if you are opening it yourself. T3 reserves and boots the device, then
+   discovers the thread's live session when the first real frame is ready. Starting a session does
+   not guess which Xcode project or scheme to build; the agent's build-and-run tool supplies those
    project details afterward.
+
+You do not have to open the Simulator panel before the agent starts. T3 watches the active thread's
+Simulator lease independently of the viewer. If no other right-side surface is active, it opens the
+embedded Simulator automatically when the thread gets a session. If you are looking at Diff, Files,
+Terminal, Agents, or another right-side surface, T3 adds a **Simulator** tab and leaves your
+current surface in place. An activity dot on that tab and the **Watch** control let you follow the
+device as it starts and becomes ready.
+
+The embedded view is the same thread-scoped session that the agent uses. T3 does not open a second
+browser page or switch to the native Simulator.app just because the agent acquired a lease.
 
 The agent's first-class iOS tools and the panel refer to the same lease. Repeating the run request
 from the same thread reuses that lease rather than opening a second Simulator.
 
 ## Watch and interact
 
-When the session is ready, the panel shows the live Simulator screen. Click the screen to focus it
-before sending input. The available controls include:
+When the session is ready, select **Simulator** or click **Watch** beside the composer to see the
+same screen the thread owns. Click the screen to focus it before sending input. The available
+controls include:
 
 - tap and drag/swipe on the screen;
 - wheel or trackpad scrolling;
@@ -54,7 +65,10 @@ the agent is issuing a semantic action to the same device; the agent should take
 after any manual intervention because the screen may have changed.
 
 Closing the panel only closes the viewer. It does not stop a build, release the Simulator, or stop
-the agent's work.
+the agent's work. If you close the **Simulator** surface itself, T3 treats that as a deliberate
+choice for the current lease: status refreshes and reconnects do not reopen it. A new Simulator
+lease can surface the viewer again. You can always select **Open Simulator** or the **Simulator**
+tab to watch the existing lease manually.
 
 ## What the agent can do
 
@@ -82,9 +96,10 @@ unbounded wait inside the agent call. Release the owning session, then release/r
 request.
 
 To free a session, use **Release** in the Simulator panel or ask the owning agent to close its
-session. Release stops only the T3-owned build/stream helpers for that lease and makes the device
-available to the next queued request. T3 does not erase the Simulator or delete unrelated Xcode
-data during an ordinary release.
+session. Release stops only the T3-owned build/stream helpers for that lease, removes its live
+viewer state, and makes the device available to the next queued request. A released lease cannot
+receive late viewer input. T3 does not erase the Simulator or delete unrelated Xcode data during
+an ordinary release.
 
 ## Unsupported hosts and remote use
 

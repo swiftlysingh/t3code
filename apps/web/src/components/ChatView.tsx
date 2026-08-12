@@ -163,6 +163,7 @@ import {
   CheckCircle2Icon,
   ChevronDownIcon,
   GitBranchIcon,
+  SmartphoneIcon,
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
@@ -344,6 +345,7 @@ import {
   serverUpdateGuidance,
 } from "../versionSkew";
 import { useAssetUrls } from "../assets/assetUrls";
+import { useSimulatorActivity } from "./simulator/useSimulatorActivity";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
@@ -1575,6 +1577,7 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThreadEnvironmentId, activeThreadId],
   );
   const activeThreadKey = activeThreadRef ? scopedThreadKey(activeThreadRef) : null;
+  const simulatorActivity = useSimulatorActivity(isServerThread ? activeThreadRef : null);
   const [timelineAnchor, setTimelineAnchor] = useState<{
     readonly threadKey: string | null;
     readonly messageId: MessageId | null;
@@ -1716,6 +1719,14 @@ function ChatViewContent(props: ChatViewProps) {
   const pendingFileSurfaceIds = activeProjectKey
     ? (pendingFileSurfaceIdsByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS)
     : EMPTY_PENDING_FILE_SURFACE_IDS;
+  const rightPanelAttentionSurfaceIds = useMemo(() => {
+    if (!simulatorActivity.session || activeRightPanelSurface?.kind === "simulator") {
+      return pendingFileSurfaceIds;
+    }
+    const attention = new Set(pendingFileSurfaceIds);
+    attention.add("simulator");
+    return attention;
+  }, [activeRightPanelSurface?.kind, pendingFileSurfaceIds, simulatorActivity.session]);
   const handleFilePendingChange = useCallback(
     (relativePath: string, pending: boolean) => {
       if (!activeProjectKey) return;
@@ -4354,6 +4365,42 @@ function ChatViewContent(props: ChatViewProps) {
   // interrupting, and works by session, so no active turn is needed.
   const activeBackgroundLiveness =
     !isWorking && activeThread ? (activeThreadShell?.backgroundLiveness ?? null) : null;
+  const simulatorBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    const session = simulatorActivity.session;
+    if (!session || activeRightPanelKind === "simulator") return null;
+    const title =
+      session.state === "ready"
+        ? `${simulatorActivity.deviceLabel} is live`
+        : session.state === "starting"
+          ? `Getting ${simulatorActivity.deviceLabel} ready`
+          : session.state === "queued"
+            ? `${simulatorActivity.deviceLabel} is waiting for this thread`
+            : `${simulatorActivity.deviceLabel} needs attention`;
+    return {
+      id: `simulator:${session.leaseId}:${session.generation}`,
+      variant: session.state === "failed" ? "warning" : "default",
+      icon: <SmartphoneIcon />,
+      title,
+      description:
+        session.state === "ready"
+          ? isWorking || activeBackgroundLiveness !== null
+            ? "Watch the screen while this thread works."
+            : "This thread still owns the live device."
+          : null,
+      actions: (
+        <Button size="xs" variant="outline" onClick={addSimulatorSurface}>
+          Watch
+        </Button>
+      ),
+    };
+  }, [
+    activeBackgroundLiveness,
+    activeRightPanelKind,
+    addSimulatorSurface,
+    isWorking,
+    simulatorActivity.deviceLabel,
+    simulatorActivity.session,
+  ]);
   const [isStoppingBackgroundWork, setIsStoppingBackgroundWork] = useState(false);
   useEffect(() => {
     // "Stopping..." holds until the liveness clears; the interrupt command
@@ -4448,8 +4495,9 @@ function ChatViewContent(props: ChatViewProps) {
   // calm-styled live states flagged `urgent`, like update progress), then
   // background liveness — its Stop button is the only stop affordance for
   // settled turns, so a passive "update available" notice must not cover it —
-  // then calm system banners, the woke and branch-mismatch notices, and the
-  // informational parked-thread banner last — it must never cover another.
+  // then Simulator activity, calm system banners, the woke and branch-mismatch
+  // notices, and the informational parked-thread banner last — it must never
+  // cover another.
   const parkedThreadBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
     if (!activeThreadSnoozed && !activeThreadSettled) {
       return null;
@@ -4505,12 +4553,14 @@ function ChatViewContent(props: ChatViewProps) {
     const calmSystemItems = systemComposerBannerItems.filter((item) => !isUrgentSystemItem(item));
     const backgroundLivenessItems =
       backgroundLivenessBannerItem === null ? [] : [backgroundLivenessBannerItem];
+    const simulatorItems = simulatorBannerItem === null ? [] : [simulatorBannerItem];
     const wokeThreadItems = wokeThreadBannerItem === null ? [] : [wokeThreadBannerItem];
     const parkedThreadItems = parkedThreadBannerItem === null ? [] : [parkedThreadBannerItem];
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
         ...urgentSystemItems,
         ...backgroundLivenessItems,
+        ...simulatorItems,
         ...calmSystemItems,
         ...wokeThreadItems,
         ...parkedThreadItems,
@@ -4519,6 +4569,7 @@ function ChatViewContent(props: ChatViewProps) {
     return [
       ...urgentSystemItems,
       ...backgroundLivenessItems,
+      ...simulatorItems,
       ...calmSystemItems,
       ...wokeThreadItems,
       {
@@ -4570,6 +4621,7 @@ function ChatViewContent(props: ChatViewProps) {
     localCheckoutBranchMismatch,
     parkedThreadBannerItem,
     showBranchMismatchBanner,
+    simulatorBannerItem,
     systemComposerBannerItems,
     wokeThreadBannerItem,
   ]);
@@ -6527,7 +6579,7 @@ function ChatViewContent(props: ChatViewProps) {
           maximized={rightPanelMaximized}
           surfaces={rightPanelState.surfaces}
           activeSurfaceId={activeRightPanelSurface?.id ?? null}
-          pendingSurfaceIds={pendingFileSurfaceIds}
+          pendingSurfaceIds={rightPanelAttentionSurfaceIds}
           previewSessions={activePreviewState.sessions}
           terminalLabelsById={activeTerminalLabelsById}
           onActivate={activateRightPanelSurface}
@@ -6562,7 +6614,7 @@ function ChatViewContent(props: ChatViewProps) {
             layoutControls={panelToggleControls}
             surfaces={rightPanelState.surfaces}
             activeSurfaceId={activeRightPanelSurface?.id ?? null}
-            pendingSurfaceIds={pendingFileSurfaceIds}
+            pendingSurfaceIds={rightPanelAttentionSurfaceIds}
             previewSessions={activePreviewState.sessions}
             terminalLabelsById={activeTerminalLabelsById}
             onActivate={activateRightPanelSurface}

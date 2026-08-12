@@ -14,6 +14,14 @@ device and send typed, authenticated input through T3. The embedded view is the 
 a lease does not open or focus the shared native Simulator.app. A user can explicitly open that
 exact device in Simulator.app from the panel when they need the native UI.
 
+The client discovers a thread's active lease independently of whether the Simulator viewer is
+mounted. A thread-scoped discovery bridge reconciles session events and status, ensures the
+Simulator surface exists when a live lease is found, and keeps the surface tied to that exact lease
+generation. If another right-panel surface is active, discovery adds a Simulator tab without
+changing the active surface; the user can choose **Watch** to view it. If no other surface is
+active, the embedded viewer may be opened automatically as soon as the lease is discovered. This is
+viewer discovery only: it does not create a second lease, stream, or XcodeBuildMCP client.
+
 The operating system of the machine running the T3 server determines whether the capability is
 available. A browser or desktop client does not need to run on macOS: a client on Linux or Windows
 can connect to a T3 server on a supported Mac and use that Mac's Simulator. Linux and Windows
@@ -170,6 +178,12 @@ idempotent and returns the existing lease. Closing the panel is not a release: a
 viewer while an agent is still building or inspecting the app. Release is explicit, runs when the
 thread is deleted, or runs when the server's Simulator layer shuts down.
 
+Closing the Simulator surface is a separate, viewer-only action. The client records that the user
+dismissed the surface for the current lease generation, so later status refreshes, reconnects, or
+duplicate session events do not reopen it. A new lease generation is eligible for automatic
+discovery again. This suppression never changes lease ownership and never stops the agent's build
+or automation.
+
 ## Session lifecycle
 
 The observable states are deliberately explicit:
@@ -199,10 +213,17 @@ Acquisition is an event-driven sequence:
 If any step fails, the manager reports the failing stage and preserves enough diagnostics to retry
 or close. It does not silently switch worktrees or UDIDs after the app has started.
 
+The client-side discovery bridge can observe the starting and ready events before the viewer is
+mounted, then reconcile the authoritative status on reconnect. It adds the thread's Simulator
+surface at most once for the lease generation. A currently active Diff, Files, Terminal, Agents,
+or browser surface remains active; the Simulator tab carries an activity dot and the composer's
+**Watch** control activates the viewer on demand.
+
 Release first closes the lease-scoped XcodeBuildMCP session and its running app, then removes the
 manager lease, stops only the exact `serve-sim` child captured for the lease, releases the verified
-host locks, and signals the local queue. Thread deletion follows the same owner-scoped cleanup
-order. Server shutdown closes the managed children and locks. Unknown processes are left alone.
+host locks, invalidates the media and input generation, removes the live viewer state, and signals
+the local queue. Thread deletion follows the same owner-scoped cleanup order. Server shutdown
+closes the managed children and locks. Unknown processes are left alone.
 
 ## XcodeBuildMCP integration
 
@@ -310,6 +331,10 @@ The shared web surface is the product UI, and desktop receives it through the de
 panel shows:
 
 - host capability and an explicit unsupported reason;
+- automatic discovery of the current thread's live lease, even when the Simulator viewer was not
+  already mounted;
+- a Simulator tab with an activity indicator when another right-panel surface is active, plus a
+  **Watch** control that activates the embedded viewer without creating another session;
 - a compact ready rail with device name/runtime, stream reconnect, explicit native open, session
   details, device-ID copy, and release actions;
 - queued, starting, ready, and failed states;
@@ -323,8 +348,11 @@ browser therefore sees the same session as a local desktop client, subject to it
 permissions and network path.
 
 Closing or navigating away from the panel only detaches the viewer. It does not release a lease or
-stop an agent's build. The user uses the explicit release action, or the owner thread is deleted or
-the Simulator server layer shuts down, to return the device to the queue.
+stop an agent's build. Closing the Simulator surface records a one-shot dismissal for the current
+lease generation, so ordinary reconciliation does not reopen it. The user uses the explicit
+release action, or the owner thread is deleted or the Simulator server layer shuts down, to return
+the device to the queue. Release also removes the live viewer state and fences late input for that
+lease.
 
 ## Failure and recovery
 
@@ -341,7 +369,7 @@ Failures are surfaced with a stable category and a next action where possible:
 | Sidecar exit                             | Mark the lease failed, fence the generation, and release the owned sidecar and locks.                                        |
 | XcodeBuildMCP child/tool failure         | Return a typed automation error; close and recreate the lease-scoped client after release.                                   |
 | Expired media token or stale input       | Reject the request; the client refreshes status/media credentials.                                                           |
-| Thread deletion or T3 server shutdown    | Run owner-scoped cleanup and release the host lock only after child identity is verified.                                    |
+| Thread deletion or T3 server shutdown    | Run owner-scoped cleanup, remove the live viewer state, and release the host lock only after child identity is verified.     |
 
 Recovery must be explicit and repeatable. A client can reconnect to a live lease and refresh its
 signed media URL; reconnecting does not create a second lease. A failed setup is released before a
@@ -378,7 +406,7 @@ Focused automated coverage is split across the independently failing boundaries:
   stale-generation rejection, tool annotations, and lease cleanup;
 - web helper and store tests cover view-state derivation, same-origin stream capabilities,
   letterboxed coordinate mapping, HID allowlisting, bounded wheel input, orientation, and the
-  Simulator right-panel state.
+  Simulator right-panel state, including non-disruptive tab insertion and idempotent discovery.
 
 The supported-host acceptance pass was completed on Apple Silicon macOS with real `simctl`, the
 pinned `serve-sim`, and a private pinned XcodeBuildMCP child. It acquired an exact device,

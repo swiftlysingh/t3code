@@ -5,10 +5,12 @@ import {
   clampSimulatorScrollDelta,
   deriveSimulatorPanelViewState,
   enqueueSimulatorInput,
+  fitSimulatorDisplayWidth,
   hidUsageForKeyboardCode,
   mapPointToContainedMedia,
   nextSimulatorOrientation,
   resolveSimulatorStreamUrl,
+  stepSimulatorDisplayScale,
   simulatorMediaDimensionsForOrientation,
 } from "./SimulatorPanel.helpers";
 
@@ -177,5 +179,41 @@ describe("SimulatorPanel static state and media URLs", () => {
         nextOrientation: "landscape_left",
       }),
     ).toEqual({ width: 2622, height: 1206 });
+  });
+});
+
+describe("SimulatorPanel display scale", () => {
+  it("steps through compact sizes and fit mode without exceeding either end", () => {
+    expect(stepSimulatorDisplayScale(0.75, "out")).toBe(0.75);
+    expect(stepSimulatorDisplayScale(0.75, "in")).toBe(1);
+    expect(stepSimulatorDisplayScale(1.5, "in")).toBe(1.5);
+    expect(stepSimulatorDisplayScale("fit", "out", 0.95)).toBe(0.75);
+    expect(stepSimulatorDisplayScale("fit", "in", 0.95)).toBe(1);
+    expect(stepSimulatorDisplayScale("fit", "out", 0.7)).toBe("fit");
+    expect(stepSimulatorDisplayScale("fit", "in", 1.6)).toBe("fit");
+  });
+
+  it("fits the whole display within both panel width and visible height", () => {
+    expect(
+      fitSimulatorDisplayWidth({
+        availableWidth: 400,
+        availableHeight: 600,
+        media: { width: 100, height: 200 },
+      }),
+    ).toBe(300);
+    expect(
+      fitSimulatorDisplayWidth({
+        availableWidth: 400,
+        availableHeight: 600,
+        media: { width: 200, height: 100 },
+      }),
+    ).toBe(400);
+    expect(
+      fitSimulatorDisplayWidth({
+        availableWidth: 400,
+        availableHeight: 0,
+        media: { width: 100, height: 200 },
+      }),
+    ).toBeNull();
   });
 });

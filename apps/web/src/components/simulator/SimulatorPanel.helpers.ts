@@ -29,7 +29,80 @@ export interface ContainedMediaPointInput {
   };
 }
 
+export interface SimulatorDisplayBounds {
+  readonly availableWidth: number;
+  readonly availableHeight: number;
+  readonly media: {
+    readonly width: number;
+    readonly height: number;
+  };
+}
+
 export const SIMULATOR_SCROLL_DELTA_LIMIT = 120;
+export type SimulatorDisplayScale = 0.75 | 1 | 1.25 | 1.5 | "fit";
+
+export function fitSimulatorDisplayWidth(input: SimulatorDisplayBounds): number | null {
+  const { availableWidth, availableHeight, media } = input;
+  if (
+    !Number.isFinite(availableWidth) ||
+    !Number.isFinite(availableHeight) ||
+    !Number.isFinite(media.width) ||
+    !Number.isFinite(media.height) ||
+    availableWidth <= 0 ||
+    availableHeight <= 0 ||
+    media.width <= 0 ||
+    media.height <= 0
+  ) {
+    return null;
+  }
+
+  return Math.min(availableWidth, availableHeight * (media.width / media.height));
+}
+
+export function stepSimulatorDisplayScale(
+  current: SimulatorDisplayScale,
+  direction: "in" | "out",
+  fittedScale = 1,
+): SimulatorDisplayScale {
+  if (current === "fit") {
+    if (direction === "out") {
+      if (fittedScale > 1.5) return 1.5;
+      if (fittedScale > 1.25) return 1.25;
+      if (fittedScale > 1) return 1;
+      if (fittedScale > 0.75) return 0.75;
+      return "fit";
+    }
+    if (fittedScale < 0.75) return 0.75;
+    if (fittedScale < 1) return 1;
+    if (fittedScale < 1.25) return 1.25;
+    if (fittedScale < 1.5) return 1.5;
+    return "fit";
+  }
+
+  if (direction === "in") {
+    switch (current) {
+      case 0.75:
+        return 1;
+      case 1:
+        return 1.25;
+      case 1.25:
+        return 1.5;
+      case 1.5:
+        return 1.5;
+    }
+  }
+
+  switch (current) {
+    case 1.5:
+      return 1.25;
+    case 1.25:
+      return 1;
+    case 1:
+      return 0.75;
+    case 0.75:
+      return 0.75;
+  }
+}
 
 export function deriveSimulatorPanelViewState(input: {
   readonly queryFailed: boolean;
