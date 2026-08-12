@@ -67,6 +67,7 @@ interface RightPanelTabsProps {
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
+  simulatorAvailable: boolean;
   pullRequestStatuses?: Readonly<Record<string, PullRequestTabStatus>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
@@ -88,6 +89,7 @@ const SURFACE_DISABLED_REASONS = {
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
   agents: "Agents are only available from a thread.",
+  simulator: "Simulator is only available from a server thread.",
 } as const;
 
 type TabContextMenuAction = "copy-path" | "close" | "close-others" | "close-to-right" | "close-all";
@@ -134,6 +136,7 @@ function RightPanelEmptyState(props: {
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
+  simulatorAvailable: boolean;
   liveAgentCount: number;
 }) {
   const actions = [
@@ -195,9 +198,10 @@ function RightPanelEmptyState(props: {
       label: "Simulator",
       description: "Reserve an iOS Simulator lease.",
       icon: Smartphone,
-      available: true,
-      disabledReason: null,
+      available: props.simulatorAvailable,
+      disabledReason: SURFACE_DISABLED_REASONS.simulator,
       onClick: props.onAddSimulator,
+      badgeCount: 0,
     },
   ] as const;
 
@@ -592,7 +596,11 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     <Bot />
                     Agents
                   </SurfaceMenuItem>
-                  <SurfaceMenuItem available onClick={props.onAddSimulator}>
+                  <SurfaceMenuItem
+                    available={props.simulatorAvailable}
+                    disabledReason={SURFACE_DISABLED_REASONS.simulator}
+                    onClick={props.onAddSimulator}
+                  >
                     <Smartphone />
                     Simulator
                   </SurfaceMenuItem>
@@ -619,6 +627,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}
             agentsAvailable={props.agentsAvailable}
+            simulatorAvailable={props.simulatorAvailable}
             liveAgentCount={props.liveAgentCount}
           />
         ) : (
