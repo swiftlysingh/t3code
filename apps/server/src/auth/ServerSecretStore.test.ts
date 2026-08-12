@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as PlatformError from "effect/PlatformError";
 
@@ -17,6 +18,9 @@ const makeServerConfigLayer = () =>
 
 const makeServerSecretStoreLayer = () =>
   Layer.provide(ServerSecretStore.layer, makeServerConfigLayer());
+
+const makeServerSecretStoreWithConfigLayer = () =>
+  ServerSecretStore.layer.pipe(Layer.provideMerge(makeServerConfigLayer()));
 
 const PermissionDeniedFileSystemLayer = Layer.effect(
   FileSystem.FileSystem,
@@ -167,6 +171,70 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
     }).pipe(Effect.provide(makeServerSecretStoreLayer())),
   );
 
+  it.effect("recreates a deleted secrets directory before creating or setting a secret", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const secretStore = yield* ServerSecretStore.ServerSecretStore;
+
+      yield* fileSystem.remove(config.secretsDir, { recursive: true });
+      const generated = yield* secretStore.getOrCreateRandom("session-signing-key", 32);
+      const created = Option.getOrThrow(yield* secretStore.get("session-signing-key"));
+      const createdInfo = yield* fileSystem.stat(
+        path.join(config.secretsDir, "session-signing-key.bin"),
+      );
+
+      assert.deepEqual(Array.from(created), Array.from(generated));
+      assert.equal(createdInfo.mode & 0o777, 0o600);
+
+      yield* fileSystem.remove(config.secretsDir, { recursive: true });
+      const replacement = Uint8Array.from([1, 2, 3]);
+      yield* secretStore.set("replacement-signing-key", replacement);
+      const persisted = Option.getOrThrow(yield* secretStore.get("replacement-signing-key"));
+      const directoryInfo = yield* fileSystem.stat(config.secretsDir);
+      const replacementInfo = yield* fileSystem.stat(
+        path.join(config.secretsDir, "replacement-signing-key.bin"),
+      );
+
+      assert.deepEqual(Array.from(persisted), Array.from(replacement));
+      assert.equal(directoryInfo.mode & 0o777, 0o700);
+      assert.equal(replacementInfo.mode & 0o777, 0o600);
+    }).pipe(Effect.provide(makeServerSecretStoreWithConfigLayer())),
+  );
+
+  it.effect("does not follow a replaced secrets-directory symlink", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const secretStore = yield* ServerSecretStore.ServerSecretStore;
+      const outsideDirectory = path.join(config.stateDir, "outside-secrets");
+      const outsideSecretPath = path.join(outsideDirectory, "session-signing-key.bin");
+      const outsideSecret = Uint8Array.from([9, 8, 7]);
+
+      yield* fileSystem.makeDirectory(outsideDirectory, { recursive: true, mode: 0o755 });
+      yield* fileSystem.chmod(outsideDirectory, 0o755);
+      yield* fileSystem.writeFile(outsideSecretPath, outsideSecret);
+      yield* fileSystem.remove(config.secretsDir, { recursive: true });
+      yield* fileSystem.symlink(outsideDirectory, config.secretsDir);
+
+      const readError = yield* Effect.flip(secretStore.get("session-signing-key"));
+      const removeError = yield* Effect.flip(secretStore.remove("session-signing-key"));
+      const persistError = yield* Effect.flip(
+        secretStore.set("session-signing-key", Uint8Array.from([1, 2, 3])),
+      );
+      const outsideInfo = yield* fileSystem.stat(outsideDirectory);
+      const persistedOutsideSecret = yield* fileSystem.readFile(outsideSecretPath);
+
+      assert.instanceOf(readError, ServerSecretStore.SecretStoreReadError);
+      assert.instanceOf(removeError, ServerSecretStore.SecretStoreRemoveError);
+      assert.instanceOf(persistError, ServerSecretStore.SecretStorePersistError);
+      assert.equal(outsideInfo.mode & 0o777, 0o755);
+      assert.deepEqual(Array.from(persistedOutsideSecret), Array.from(outsideSecret));
+    }).pipe(Effect.provide(makeServerSecretStoreWithConfigLayer())),
+  );
+
   it.effect("returns the persisted secret when concurrent creators race", () =>
     Effect.gen(function* () {
       const secretStore = yield* ServerSecretStore.ServerSecretStore;
@@ -197,6 +265,18 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
           return {
             ...fileSystem,
             makeDirectory: () => Effect.void,
+            readLink: (path) =>
+              Effect.fail(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: "FileSystem",
+                  method: "readLink",
+                  pathOrDescriptor: path,
+                  cause: Object.assign(new Error("Path is not a symbolic link."), {
+                    code: "EINVAL",
+                  }),
+                }),
+              ),
             writeFile: () => Effect.void,
             rename: () => Effect.void,
             chmod: (path, mode) =>
